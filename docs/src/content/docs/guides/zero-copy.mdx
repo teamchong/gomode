@@ -1,0 +1,75 @@
+---
+title: Zero-Copy Data
+description: Eliminate serialization with zero-copy data exchange via WASM shared memory.
+---
+
+## The problem
+
+The typical WASM data flow has 5 serialization steps:
+
+```
+JS: JSON.stringify(request)          ← serialize
+JS: write JSON bytes to WASM memory  ← copy
+Go: json.Unmarshal(reqBytes)         ← parse
+Go: json.Marshal(response)           ← serialize
+JS: JSON.parse(respText)             ← parse
+```
+
+For a simple hello-world this doesn't matter. For 10K-row datasets, it's the bottleneck.
+
+## The zero-copy path
+
+With [zerobuf](https://github.com/teamchong/zerobuf) (planned integration):
+
+```
+JS: write request fields to WASM memory (zerobuf layout)  ← direct write
+Go: read fields from WASM memory at known offsets          ← direct read
+Go: write response fields to WASM memory                   ← direct write
+JS: Proxy reads fields from WASM memory on access          ← direct read
+```
+
+No serialization. No parsing. Just pointer reads on shared memory.
+
+## Columnar tables (available now)
+
+For bulk data, GoMode uses an Arrow-like columnar layout via Zig:
+
+```go
+// Go side — push values into columns
+//go:wasmimport gomode zig_table_create
+func zigTableCreate(nCols uint32) uint32
+
+//go:wasmimport gomode zig_table_push_i32
+func zigTablePushI32(table uint32, colIdx uint32, value int32) int32
+
+//go:wasmimport gomode zig_table_push_f64
+func zigTablePushF64(table uint32, colIdx uint32, value float64) int32
+```
+
+```typescript
+// JS side — read via Proxy, zero copy
+const row = table.row(0);
+row.id;    // DataView.getInt32(col_ptr + 0*4)
+row.score; // DataView.getFloat64(col_ptr + 0*8)
+row.name;  // TextDecoder on byte range
+```
+
+Data stays in `wasm.memory`. JS reads it directly via `DataView`. No JSON, no copies.
+
+## zerobuf integration (planned)
+
+[zerobuf](https://github.com/teamchong/zerobuf) provides a shared binary layout for JS and WASM. Both sides agree on the byte format (tagged values, strings, arrays, objects) and read/write the same memory.
+
+Go reads/writes zerobuf format using `unsafe.Pointer` at known byte offsets:
+
+```go
+// Read an f64 from a zerobuf tagged value slot
+// Layout: [tag:u8] [pad:3] [ptr:u32] [f64:8]
+val := *(*float64)(unsafe.Pointer(uintptr(ptr) + 8))
+
+// Read a zerobuf string: [len:u32] [utf8 bytes...]
+slen := *(*uint32)(unsafe.Pointer(uintptr(strPtr)))
+bytes := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(strPtr)+4)), int(slen))
+```
+
+No Zig linking needed — Go just follows the same byte layout that JS and Zig already agree on.

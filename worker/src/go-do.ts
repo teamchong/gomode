@@ -1,21 +1,12 @@
 /**
- * GoDO — Durable Object that runs TinyGo + Zig ABI WASM.
+ * GoDO — Durable Object that runs TinyGo WASM.
  *
- * Each request:
- * 1. Serializes CF Request → JSON
- * 2. Writes JSON to WASM stdin
- * 3. Runs go.wasm (_start)
- * 4. Reads response JSON from stdout
- * 5. Builds CF Response
+ * WASM instance is created once and kept alive for the lifetime of the DO.
+ * Each request calls the exported handle() function — no re-instantiation.
  *
- * Host imports (gomode_host namespace) provide raw I/O:
- * - host_net_connect/send/recv/close (raw sockets via CF connect())
- * - host_random_get (crypto.getRandomValues)
- * - host_time_now (Date.now)
- * - host_console_log (console.log)
- * - host_kv_get/put (CF KV via binding)
- *
- * Columnar data stays in wasm.memory — JS reads via DataView (zero copy).
+ * Flow:
+ * 1. First request: compile + instantiate WASM, call _start() to init Go runtime
+ * 2. Every request: write request JSON to WASM memory, call handle(), read response
  */
 
 import goWasmModule from "./go.wasm";
@@ -27,16 +18,56 @@ interface Env {
   [key: string]: unknown;
 }
 
+interface GoWasmExports {
+  memory: WebAssembly.Memory;
+  _start: () => void;
+  gomode_malloc: (size: number) => number;
+  handle: (reqPtr: number, reqLen: number) => number;
+  getResponsePtr: () => number;
+}
+
 export class GoDO implements DurableObject {
   private state: DurableObjectState;
   private env: Env;
+  private wasmExports: GoWasmExports | null = null;
+  private initPromise: Promise<void> | null = null;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
   }
 
+  private async initWasm(): Promise<void> {
+    const imports: WebAssembly.Imports = {
+      wasi_snapshot_preview1: this.buildWasiImports(),
+      gomode_host: this.buildHostImports(),
+    };
+
+    const instance = await WebAssembly.instantiate(goWasmModule, imports);
+    this.wasmExports = instance.exports as unknown as GoWasmExports;
+
+    // Call _start() to initialize the Go runtime.
+    // TinyGo calls proc_exit(0) at the end of main(), which throws.
+    try {
+      this.wasmExports._start();
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!msg.includes("exit code: 0") && !msg.includes("proc_exit")) {
+        throw e;
+      }
+    }
+  }
+
   async fetch(request: Request): Promise<Response> {
+    // Initialize WASM once (lazy, on first request)
+    if (!this.wasmExports) {
+      if (!this.initPromise) {
+        this.initPromise = this.initWasm();
+      }
+      await this.initPromise;
+    }
+
+    const exports = this.wasmExports!;
     const url = new URL(request.url);
     const headers: Record<string, string> = {};
     request.headers.forEach((v, k) => {
@@ -59,51 +90,23 @@ export class GoDO implements DurableObject {
 
     const reqBytes = textEncoder.encode(reqJson);
 
-    let stdinOffset = 0;
-    const stdoutChunks: Uint8Array[] = [];
-    const stderrChunks: Uint8Array[] = [];
+    // Write request into WASM memory
+    const reqPtr = exports.gomode_malloc(reqBytes.length);
+    new Uint8Array(exports.memory.buffer, reqPtr, reqBytes.length).set(
+      reqBytes
+    );
 
-    let wasmMemory: WebAssembly.Memory;
+    // Call handle — returns response length
+    const respLen = exports.handle(reqPtr, reqBytes.length);
+    const respPtr = exports.getResponsePtr();
 
-    const imports: WebAssembly.Imports = {
-      wasi_snapshot_preview1: this.buildWasiImports(
-        reqBytes,
-        () => stdinOffset,
-        (n: number) => {
-          stdinOffset += n;
-        },
-        stdoutChunks,
-        stderrChunks,
-        () => wasmMemory
-      ),
-      gomode_host: this.buildHostImports(() => wasmMemory),
-    };
-
-    const instance = await WebAssembly.instantiate(goWasmModule, imports);
-    const exports = instance.exports as {
-      memory: WebAssembly.Memory;
-      _start: () => void;
-    };
-    wasmMemory = exports.memory;
-
-    try {
-      exports._start();
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (!msg.includes("exit code: 0") && !msg.includes("proc_exit")) {
-        const stderr = concatBuffers(stderrChunks);
-        return new Response(
-          JSON.stringify({
-            error: msg,
-            stderr: textDecoder.decode(stderr),
-          }),
-          { status: 500, headers: { "content-type": "application/json" } }
-        );
-      }
-    }
-
-    const stdout = concatBuffers(stdoutChunks);
-    const respText = textDecoder.decode(stdout);
+    // Read response from WASM memory
+    const respBytes = new Uint8Array(
+      exports.memory.buffer,
+      respPtr,
+      respLen
+    );
+    const respText = textDecoder.decode(respBytes);
 
     try {
       const resp = JSON.parse(respText) as {
@@ -132,17 +135,10 @@ export class GoDO implements DurableObject {
     }
   }
 
-  /**
-   * WASI preview1 imports — enough for TinyGo's _start().
-   */
-  private buildWasiImports(
-    stdinData: Uint8Array,
-    getStdinOffset: () => number,
-    advanceStdin: (n: number) => void,
-    stdoutChunks: Uint8Array[],
-    stderrChunks: Uint8Array[],
-    getMemory: () => WebAssembly.Memory
-  ): Record<string, WebAssembly.ImportValue> {
+  private buildWasiImports(): Record<string, WebAssembly.ImportValue> {
+    // Memory reference is resolved lazily since exports aren't set yet
+    const getMemory = () => this.wasmExports!.memory;
+
     return {
       fd_write: (
         fd: number,
@@ -156,11 +152,12 @@ export class GoDO implements DurableObject {
         for (let i = 0; i < iovsLen; i++) {
           const ptr = mem.getUint32(iovs + i * 8, true);
           const len = mem.getUint32(iovs + i * 8 + 4, true);
-          const bytes = new Uint8Array(memory.buffer, ptr, len);
-          if (fd === 1) {
-            stdoutChunks.push(bytes.slice());
-          } else if (fd === 2) {
-            stderrChunks.push(bytes.slice());
+          if (fd === 2) {
+            const bytes = new Uint8Array(memory.buffer, ptr, len);
+            console.log(
+              "[gomode:stderr]",
+              textDecoder.decode(bytes)
+            );
           }
           written += len;
         }
@@ -169,35 +166,14 @@ export class GoDO implements DurableObject {
       },
 
       fd_read: (
-        fd: number,
-        iovs: number,
-        iovsLen: number,
+        _fd: number,
+        _iovs: number,
+        _iovsLen: number,
         nread: number
       ) => {
-        const memory = getMemory();
-        const mem = new DataView(memory.buffer);
-        if (fd !== 0) {
-          mem.setUint32(nread, 0, true);
-          return 0;
-        }
-        let totalRead = 0;
-        const offset = getStdinOffset();
-        for (let i = 0; i < iovsLen; i++) {
-          const ptr = mem.getUint32(iovs + i * 8, true);
-          const len = mem.getUint32(iovs + i * 8 + 4, true);
-          const available = stdinData.length - offset - totalRead;
-          const toRead = Math.min(len, available);
-          if (toRead > 0) {
-            const src = stdinData.subarray(
-              offset + totalRead,
-              offset + totalRead + toRead
-            );
-            new Uint8Array(memory.buffer, ptr, toRead).set(src);
-            totalRead += toRead;
-          }
-        }
-        advanceStdin(totalRead);
-        mem.setUint32(nread, totalRead, true);
+        // No stdin in reactor mode — handle() reads from memory directly
+        const mem = new DataView(getMemory().buffer);
+        mem.setUint32(nread, 0, true);
         return 0;
       },
 
@@ -211,6 +187,7 @@ export class GoDO implements DurableObject {
         mem.setBigUint64(buf + 16, 0n, true);
         return 0;
       },
+      fd_fdstat_set_flags: () => 0,
       fd_prestat_get: () => 8,
       fd_prestat_dir_name: () => 8,
 
@@ -253,7 +230,12 @@ export class GoDO implements DurableObject {
       path_unlink_file: () => 44,
       path_rename: () => 44,
       fd_readdir: () => 44,
-      poll_oneoff: (_in: number, _out: number, _nsubs: number, nevents: number) => {
+      poll_oneoff: (
+        _in: number,
+        _out: number,
+        _nsubs: number,
+        nevents: number
+      ) => {
         const mem = new DataView(getMemory().buffer);
         mem.setUint32(nevents, 0, true);
         return 0;
@@ -262,28 +244,18 @@ export class GoDO implements DurableObject {
     };
   }
 
-  /**
-   * GoMode host imports — raw I/O for the Zig ABI layer.
-   *
-   * Networking: CF Workers use fetch() for HTTP and connect() for raw TCP.
-   * Since connect() requires specific CF plans and is async, raw socket
-   * operations return -1 (connection refused). HTTP goes through the
-   * fetch() binding via Asyncify once integrated.
-   *
-   * KV: CF KV is async. Synchronous KV access requires Asyncify stack
-   * unwind/rewind to suspend WASM, await KV, resume. Returns -1 until
-   * Asyncify integration is wired up.
-   */
-  private buildHostImports(
-    getMemory: () => WebAssembly.Memory
-  ): Record<string, WebAssembly.ImportValue> {
+  private buildHostImports(): Record<string, WebAssembly.ImportValue> {
+    const getMemory = () => this.wasmExports!.memory;
+
     return {
-      host_net_connect: (hostPtr: number, hostLen: number, _port: number) => {
-        // Read hostname from WASM memory (validates the pointer is real)
+      host_net_connect: (
+        hostPtr: number,
+        hostLen: number,
+        _port: number
+      ) => {
         const _hostname = textDecoder.decode(
           new Uint8Array(getMemory().buffer, hostPtr, hostLen)
         );
-        // Raw TCP requires CF connect() API + Asyncify — returns connection refused
         return -1;
       },
       host_net_send: (_fd: number, _ptr: number, _len: number) => -1,
@@ -310,11 +282,9 @@ export class GoDO implements DurableObject {
         _bufPtr: number,
         _bufLen: number
       ) => {
-        // Read key from WASM memory (validates the pointer)
         const _key = textDecoder.decode(
           new Uint8Array(getMemory().buffer, keyPtr, keyLen)
         );
-        // CF KV is async — requires Asyncify to suspend WASM, await KV, resume
         return -1;
       },
       host_kv_put: (
@@ -326,7 +296,6 @@ export class GoDO implements DurableObject {
         const _key = textDecoder.decode(
           new Uint8Array(getMemory().buffer, keyPtr, keyLen)
         );
-        // CF KV is async — requires Asyncify to suspend WASM, await KV, resume
         return -1;
       },
     };

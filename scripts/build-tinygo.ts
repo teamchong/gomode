@@ -44,9 +44,9 @@ const result = spawnSync(
     join(buildDir, "go.wasm"),
     "-scheduler=none",
     "-gc=leaking",
-    userPath,
+    ".",
   ],
-  { cwd: root, stdio: "inherit", env: { ...process.env } }
+  { cwd: userPath, stdio: "inherit", env: { ...process.env } }
 );
 
 if (result.status !== 0) {

@@ -1,0 +1,76 @@
+---
+title: gomode
+description: Go on Cloudflare Workers — fast, small, complete.
+template: splash
+hero:
+  tagline: TinyGo + Zig ABI on Cloudflare Workers. Small binaries, complete stdlib, zero-copy data exchange.
+  actions:
+    - text: Get Started
+      link: /gomode/getting-started/
+      icon: right-arrow
+      variant: primary
+    - text: Benchmarks
+      link: /gomode/benchmarks/
+      variant: minimal
+---
+
+## The problem
+
+Go on WASM is broken in two different ways:
+
+| | Binary size | Stdlib | Speed |
+|---|---|---|---|
+| **Standard Go → WASM** | 3MB+ | Full | Slow (heavy runtime) |
+| **TinyGo → WASM** | ~700KB | Incomplete | Fast |
+
+Standard Go gives you the full stdlib but a massive binary with a heavy runtime. TinyGo gives you a small fast binary but is missing `net/http`, `crypto`, full `reflect`, and more.
+
+## GoMode's answer
+
+Use TinyGo for the small binary, use **Zig to fill every gap** — with SIMD, zero-copy memory, and no runtime overhead.
+
+```
+TinyGo (small binary, fast compile)
+  + Zig ABI (SIMD, zero-copy, polyfills missing stdlib)
+  + CF Workers (300+ edge locations, Durable Objects for state)
+  = Go on the edge, fast
+```
+
+## Quick start
+
+```go
+package main
+
+import (
+  "encoding/json"
+  "unsafe"
+)
+
+var respBuf []byte
+
+//export handle
+func handle(reqPtr, reqLen uint32) uint32 {
+  reqBytes := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(reqPtr))), int(reqLen))
+  var req map[string]interface{}
+  json.Unmarshal(reqBytes, &req)
+
+  respBuf, _ = json.Marshal(map[string]interface{}{
+    "status": 200,
+    "headers": map[string]string{"content-type": "text/plain"},
+    "body": "Hello from GoMode!",
+  })
+  return uint32(len(respBuf))
+}
+
+//export getResponsePtr
+func getResponsePtr() uint32 {
+  return uint32(uintptr(unsafe.Pointer(&respBuf[0])))
+}
+
+func main() {}
+```
+
+```bash
+npm run build:go && npm run dev
+# → http://localhost:8787
+```

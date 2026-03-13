@@ -1,0 +1,60 @@
+---
+title: Benchmarks
+description: GoMode performance vs native Go and standard Go WASM.
+---
+
+## Setup
+
+- **Machine**: Apple Silicon (M-series)
+- **Tool**: `wrk -t4 -c50 -d10s`
+- **Workload**: Simple JSON handler (hello world + JSON response)
+- **Wrangler dev** for GoMode (local miniflare runtime)
+
+## Results
+
+| | Native Go | GoMode (direct) | GoMode (DO) | Std Go WASM |
+|---|---|---|---|---|
+| **GET / req/sec** | 80,715 | 3,411 | 1,428 | 614 |
+| **GET /json req/sec** | 83,182 | 3,370 | 1,390 | 537 |
+| **Latency (avg)** | 0.6ms | 14ms | 34ms | 78ms |
+| **Binary size** | native | 753KB | 753KB | 3.0MB |
+
+## GoMode vs Standard Go WASM
+
+**5.6x faster** throughput with a **4x smaller** binary.
+
+The standard Go compiler produces a 3MB WASM binary with a heavy runtime (goroutine scheduler, full GC, large stdlib). TinyGo produces a 753KB binary with minimal runtime.
+
+## Direct vs Durable Object
+
+Direct mode is **2.4x faster** than DO mode because:
+
+- **No DO queue** — requests don't serialize through a single instance
+- **Horizontal scaling** — CF spins up multiple isolates, each with its own cached WASM instance
+- **Same warm latency** — both have ~1ms per-request cost once WASM is initialized
+
+## What's measured
+
+These benchmarks run on **wrangler dev** (local miniflare), not production CF edge. Production numbers will differ:
+
+- Lower latency (native V8 isolates, not miniflare simulation)
+- Higher throughput (multi-core, distributed)
+- Real cold start data (isolate spin-up on CF's infrastructure)
+
+## What's NOT measured yet
+
+- **Zig SIMD acceleration** — not wired up yet. Will show gains on JSON parsing, data transforms.
+- **Zero-copy path** — currently using JSON serialize/parse. zerobuf integration will eliminate this overhead.
+- **Columnar data** — bulk data workloads where the Arrow-like layout shines vs JSON.
+- **Async CF bindings** — KV, R2, D1 via Asyncify (not integrated yet).
+
+## Reproduce
+
+```bash
+# Install wrk
+brew install wrk
+
+# Run benchmark
+./bench/run.sh [duration] [connections] [threads]
+# defaults: 10s, 50 connections, 4 threads
+```

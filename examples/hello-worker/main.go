@@ -3,7 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"os"
+	"unsafe"
 )
 
 // Request matches the JSON structure from the CF Worker.
@@ -15,38 +15,36 @@ type Request struct {
 	Body    []byte            `json:"body,omitempty"`
 }
 
-// Response is serialized to JSON on stdout for the CF Worker.
+// Response is serialized to JSON for the CF Worker.
 type Response struct {
 	Status  int               `json:"status"`
 	Headers map[string]string `json:"headers"`
 	Body    string            `json:"body"`
 }
 
-func main() {
-	// Read request JSON from stdin
-	input := make([]byte, 0, 4096)
-	buf := make([]byte, 4096)
-	for {
-		n, err := os.Stdin.Read(buf)
-		if n > 0 {
-			input = append(input, buf[:n]...)
-		}
-		if err != nil {
-			break
-		}
-	}
+// Response buffer — stays alive between calls (leaking GC keeps it).
+var respBuf []byte
+
+//export gomode_malloc
+func gomodeMalloc(size uint32) uint32 {
+	buf := make([]byte, size)
+	return uint32(uintptr(unsafe.Pointer(&buf[0])))
+}
+
+//export handle
+func handle(reqPtr, reqLen uint32) uint32 {
+	reqBytes := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(reqPtr))), int(reqLen))
 
 	var req Request
-	if err := json.Unmarshal(input, &req); err != nil {
-		writeResponse(Response{
+	if err := json.Unmarshal(reqBytes, &req); err != nil {
+		respBuf = marshalResponse(Response{
 			Status:  400,
 			Headers: map[string]string{"content-type": "text/plain"},
 			Body:    "invalid request: " + err.Error(),
 		})
-		return
+		return uint32(len(respBuf))
 	}
 
-	// Route by path
 	var resp Response
 	switch req.Path {
 	case "/":
@@ -75,10 +73,24 @@ func main() {
 		}
 	}
 
-	writeResponse(resp)
+	respBuf = marshalResponse(resp)
+	return uint32(len(respBuf))
 }
 
-func writeResponse(resp Response) {
-	output, _ := json.Marshal(resp)
-	os.Stdout.Write(output)
+//export getResponsePtr
+func getResponsePtr() uint32 {
+	if len(respBuf) == 0 {
+		return 0
+	}
+	return uint32(uintptr(unsafe.Pointer(&respBuf[0])))
+}
+
+func marshalResponse(resp Response) []byte {
+	out, _ := json.Marshal(resp)
+	return out
+}
+
+func main() {
+	// No-op. Go runtime is initialized by _start().
+	// Subsequent requests call handle() directly.
 }

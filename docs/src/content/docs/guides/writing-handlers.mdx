@@ -1,0 +1,112 @@
+---
+title: Writing Handlers
+description: How to write Go request handlers for GoMode.
+---
+
+## Reactor model
+
+GoMode uses a **reactor model**: `main()` runs once to initialize the Go runtime, then `handle()` is called for each request. The WASM instance stays alive.
+
+```go
+func main() {
+  // Initialize anything global here.
+  // This runs once when WASM is first loaded.
+}
+
+//export handle
+func handle(reqPtr, reqLen uint32) uint32 {
+  // Called for every request.
+  // reqPtr points to request JSON in WASM memory.
+}
+```
+
+## Request format
+
+The Worker writes request JSON into WASM memory and passes the pointer. The request shape:
+
+```json
+{
+  "method": "GET",
+  "url": "https://example.com/api/users",
+  "path": "/api/users",
+  "headers": { "content-type": "application/json" }
+}
+```
+
+Read it with `unsafe.Slice`:
+
+```go
+reqBytes := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(reqPtr))), int(reqLen))
+
+var req struct {
+  Method  string            `json:"method"`
+  Path    string            `json:"path"`
+  Headers map[string]string `json:"headers"`
+}
+json.Unmarshal(reqBytes, &req)
+```
+
+## Response format
+
+Write response JSON to a global buffer and return its length. The Worker reads it via `getResponsePtr()`.
+
+```go
+var respBuf []byte
+
+//export handle
+func handle(reqPtr, reqLen uint32) uint32 {
+  // ... process request ...
+
+  respBuf, _ = json.Marshal(map[string]interface{}{
+    "status":  200,
+    "headers": map[string]string{"content-type": "text/plain"},
+    "body":    "Hello!",
+  })
+  return uint32(len(respBuf))
+}
+
+//export getResponsePtr
+func getResponsePtr() uint32 {
+  return uint32(uintptr(unsafe.Pointer(&respBuf[0])))
+}
+```
+
+## Memory allocation
+
+The Worker needs to allocate space in WASM memory for the request. Export a malloc function:
+
+```go
+//export gomode_malloc
+func gomodeMalloc(size uint32) uint32 {
+  buf := make([]byte, size)
+  return uint32(uintptr(unsafe.Pointer(&buf[0])))
+}
+```
+
+## Routing
+
+Route by path in your handler:
+
+```go
+switch req.Path {
+case "/":
+  // home
+case "/api/users":
+  // users endpoint
+case "/health":
+  // health check
+default:
+  // 404
+}
+```
+
+## GC considerations
+
+- **`-gc=conservative`** — Actual garbage collection. Use for long-lived DO instances with many requests.
+- **`-gc=leaking`** — Never frees memory. Smallest binary, fine for short-lived or low-traffic handlers.
+
+Build with:
+
+```bash
+tinygo build -target wasip1 -scheduler=none -gc=conservative -o go.wasm .
+```

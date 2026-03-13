@@ -1,0 +1,124 @@
+---
+title: Getting Started
+description: Set up GoMode and run your first Go handler on Cloudflare Workers.
+---
+
+## Prerequisites
+
+- **Go 1.22+** — `go version`
+- **TinyGo** — `brew install tinygo`
+- **Zig 0.15+** — [ziglang.org/download](https://ziglang.org/download/)
+- **Node.js 18+** — for wrangler
+
+## Install
+
+```bash
+git clone https://github.com/teamchong/gomode.git
+cd gomode
+npm install
+```
+
+## Build
+
+```bash
+# Build TinyGo example to WASM
+npm run build:go
+
+# Build Zig ABI (when linked)
+npm run build:zig
+
+# Build both
+npm run build
+```
+
+## Run
+
+```bash
+npm run dev
+# → http://localhost:8787
+```
+
+Two modes available:
+
+- `http://localhost:8787/` — Direct mode (stateless, max concurrency)
+- `http://localhost:8787/do/` — Durable Object mode (stateful, persistent WASM)
+
+## Project structure
+
+```
+worker/src/
+  worker.ts         — Entry point, routes to direct or DO
+  go-do.ts          — Durable Object runtime
+  columnar-proxy.ts — Zero-copy Proxy for columnar data
+
+zig-abi/src/
+  main.zig          — Zig ABI exports
+  host.zig          — Host imports (sockets, random, KV)
+  columnar.zig      — Columnar format
+
+go-sdk/
+  gomode.go         — Go SDK types and Zig FFI
+
+examples/
+  hello-worker/     — Example Go handler
+```
+
+## Your first handler
+
+Create a new directory with a `go.mod` and `main.go`:
+
+```bash
+mkdir my-handler && cd my-handler
+go mod init my-handler
+```
+
+```go
+package main
+
+import (
+  "encoding/json"
+  "unsafe"
+)
+
+var respBuf []byte
+
+//export gomode_malloc
+func gomodeMalloc(size uint32) uint32 {
+  buf := make([]byte, size)
+  return uint32(uintptr(unsafe.Pointer(&buf[0])))
+}
+
+//export handle
+func handle(reqPtr, reqLen uint32) uint32 {
+  reqBytes := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(reqPtr))), int(reqLen))
+
+  var req struct {
+    Method string `json:"method"`
+    Path   string `json:"path"`
+  }
+  json.Unmarshal(reqBytes, &req)
+
+  resp, _ := json.Marshal(map[string]interface{}{
+    "status":  200,
+    "headers": map[string]string{"content-type": "application/json"},
+    "body":    `{"hello": "from GoMode", "path": "` + req.Path + `"}`,
+  })
+  respBuf = resp
+  return uint32(len(respBuf))
+}
+
+//export getResponsePtr
+func getResponsePtr() uint32 {
+  return uint32(uintptr(unsafe.Pointer(&respBuf[0])))
+}
+
+func main() {}
+```
+
+Build and run:
+
+```bash
+tinygo build -target wasip1 -o ../build/go.wasm -scheduler=none -gc=conservative .
+cp ../build/go.wasm ../worker/src/go.wasm
+cd .. && npm run dev
+```
