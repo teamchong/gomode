@@ -1,6 +1,6 @@
 //! Host imports — minimal raw I/O surface.
 //! Design: host provides ONLY raw I/O, all parsing in WASM.
-//! Same philosophy as edgebox: ~12 host functions total.
+//! ~10 host functions total, minimal surface area.
 
 // --- Networking (raw sockets) ---
 extern "gomode_host" fn host_net_connect(host_ptr: [*]const u8, host_len: u32, port: u16) i32;

@@ -268,10 +268,10 @@ export class GoDO implements DurableObject {
    * Networking: CF Workers use fetch() for HTTP and connect() for raw TCP.
    * Since connect() requires specific CF plans and is async, raw socket
    * operations return -1 (connection refused). HTTP goes through the
-   * fetch() binding via Asyncify once integrated (same pattern as pymode).
+   * fetch() binding via Asyncify once integrated.
    *
    * KV: CF KV is async. Synchronous KV access requires Asyncify stack
-   * unwind/rewind (same pattern as pymode's kv_get). Returns -1 until
+   * unwind/rewind to suspend WASM, await KV, resume. Returns -1 until
    * Asyncify integration is wired up.
    */
   private buildHostImports(

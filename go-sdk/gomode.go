@@ -75,7 +75,7 @@ type Handler func(req Request, env Env) Response
 
 // Handle registers a request handler. This is the entry point for gomode workers.
 // It reads the request from stdin (JSON), calls the handler, and writes
-// the response to stdout (JSON). This matches pymode's stdin/stdout protocol.
+// the response to stdout (JSON), following the stdin/stdout protocol.
 func Handle(handler Handler) {
 	// Read request JSON from stdin
 	input, err := os.ReadFile("/dev/stdin")

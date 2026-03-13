@@ -1,7 +1,7 @@
 /**
  * GoMode Worker — Routes requests to GoDO (Durable Object).
  *
- * Architecture (mirrors pymode):
+ * Architecture:
  *   CF Request → Worker serializes to JSON
  *     → GoDO.fetch() → instantiates go.wasm (TinyGo + Zig ABI)
  *       → WASM reads request from stdin JSON

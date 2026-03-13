@@ -8,7 +8,7 @@
 //! - Columnar data laid out in linear memory for Proxy access
 //! - Result format: [len:u32][data...], returns 0 on error
 //!
-//! Design (from edgebox):
+//! Design:
 //! 1. Minimal host imports (raw I/O only)
 //! 2. All parsing/validation in WASM
 //! 3. Pointer-based interface, no serialization
@@ -21,7 +21,7 @@ pub const columnar = @import("columnar.zig");
 const wasm_allocator = std.heap.wasm_allocator;
 
 // ============================================================================
-// Memory Management (same pattern as edgebox)
+// Memory Management
 // ============================================================================
 
 /// Allocate memory in WASM linear memory.
