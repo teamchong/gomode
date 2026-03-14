@@ -20,9 +20,11 @@ describe("net/http conformance", () => {
       expect(data.path).toBe("/json");
     });
 
-    it("returns 404 for unregistered paths", async () => {
+    it("unregistered paths fall through to / handler (Go stdlib behavior)", async () => {
       const resp = await fetch(`${BASE}/nonexistent`);
-      expect(resp.status).toBe(404);
+      expect(resp.status).toBe(200);
+      const text = await resp.text();
+      expect(text).toContain("Hello from GoMode!");
     });
 
     it("handles root path", async () => {

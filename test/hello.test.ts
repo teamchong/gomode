@@ -24,11 +24,11 @@ describe("hello-worker", () => {
     expect(data.method).toBe("GET");
   });
 
-  it("returns 404 on unknown path", async () => {
+  it("unknown path falls through to / handler (Go stdlib behavior)", async () => {
     const resp = await fetch("http://localhost:8787/unknown");
-    expect(resp.status).toBe(404);
+    expect(resp.status).toBe(200);
     const text = await resp.text();
-    expect(text).toContain("not found");
+    expect(text).toContain("Hello from GoMode!");
   });
 
   it("returns SHA-256 hash on GET /sha256", async () => {

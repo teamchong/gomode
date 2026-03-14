@@ -11,6 +11,19 @@ import (
 	"strings"
 )
 
+// apiHandler is a struct that implements http.Handler — common pattern in real Go apps.
+type apiHandler struct {
+	version string
+}
+
+func (a *apiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"version": a.version,
+		"runtime": "gomode",
+	})
+}
+
 func main() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "Hello from GoMode!")
@@ -145,7 +158,7 @@ func main() {
 		})
 	})
 
-	// GET /fetch — outbound http.Get via Asyncify
+	// GET /fetch — outbound http.Get via two-phase fetch
 	http.HandleFunc("/fetch", func(w http.ResponseWriter, r *http.Request) {
 		url := r.FormValue("url")
 		if url == "" {
@@ -160,6 +173,149 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":         resp.StatusCode,
 			"content_length": resp.ContentLength,
+		})
+	})
+
+	// ---- Real-world compatibility endpoints ----
+
+	// Middleware pattern: func(http.Handler) http.Handler
+	corsMiddleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			if r.Method == "OPTIONS" {
+				w.WriteHeader(204)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+
+	// Handler struct pattern — implements http.Handler
+	api := &apiHandler{version: "1.0.0"}
+	http.Handle("/api/info", corsMiddleware(api))
+
+	// Method-based routing
+	http.HandleFunc("/api/items", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		switch r.Method {
+		case "GET":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"items": []map[string]string{
+					{"id": "1", "name": "alpha"},
+					{"id": "2", "name": "beta"},
+				},
+			})
+		case "POST":
+			var body struct {
+				Name string `json:"name"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, `{"error":"invalid json"}`, 400)
+				return
+			}
+			if body.Name == "" {
+				http.Error(w, `{"error":"name required"}`, 422)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(201)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":      "3",
+				"name":    body.Name,
+				"created": true,
+			})
+		case "DELETE":
+			w.WriteHeader(204)
+		default:
+			http.Error(w, `{"error":"method not allowed"}`, 405)
+		}
+	})
+
+	// StripPrefix pattern
+	http.Handle("/static/", http.StripPrefix("/static", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"stripped_path": r.URL.Path,
+		})
+	})))
+
+	// Content negotiation via Accept header
+	http.HandleFunc("/negotiate", func(w http.ResponseWriter, r *http.Request) {
+		accept := r.Header.Get("Accept")
+		switch {
+		case strings.Contains(accept, "text/plain"):
+			w.Header().Set("Content-Type", "text/plain")
+			fmt.Fprintf(w, "version=1.0.0 status=ok")
+		case strings.Contains(accept, "text/html"):
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprintf(w, "<h1>Status: OK</h1>")
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": "1.0.0"})
+		}
+	})
+
+	// Multiple cookies + secure cookie attributes
+	http.HandleFunc("/multi-cookie", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{
+			Name:     "sid",
+			Value:    "sess-abc",
+			Path:     "/",
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteStrictMode,
+		})
+		http.SetCookie(w, &http.Cookie{
+			Name:   "theme",
+			Value:  "dark",
+			Path:   "/",
+			MaxAge: 86400,
+		})
+		fmt.Fprintf(w, "cookies set")
+	})
+
+	// MaxBytesReader — body size limiting
+	http.HandleFunc("/limited", func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 64)
+		var body struct {
+			Data string `json:"data"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, `{"error":"body too large or invalid"}`, 413)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"received": len(body.Data),
+			"data":     body.Data,
+		})
+	})
+
+	// Chained write — multiple w.Write calls build response
+	http.HandleFunc("/chunked-write", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write([]byte("line1\n"))
+		w.Write([]byte("line2\n"))
+		w.Write([]byte("line3\n"))
+	})
+
+	// Request context — URL parts, proto, method reflection
+	http.HandleFunc("/reflect", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"method":       r.Method,
+			"path":         r.URL.Path,
+			"raw_query":    r.URL.RawQuery,
+			"host":         r.Host,
+			"proto":        r.Proto,
+			"proto_at_1_1": r.ProtoAtLeast(1, 1),
+			"request_uri":  r.RequestURI,
+			"referer":      r.Referer(),
+			"user_agent":   r.UserAgent(),
+			"content_len":  r.ContentLength,
 		})
 	})
 

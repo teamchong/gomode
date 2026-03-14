@@ -599,8 +599,24 @@ func (mux *ServeMux) HandleFunc(pattern string, handler func(ResponseWriter, *Re
 }
 
 func (mux *ServeMux) Handler(r *Request) (h Handler, pattern string) {
-	if h, ok := mux.entries[r.URL.Path]; ok {
-		return h, r.URL.Path
+	path := r.URL.Path
+	// Exact match first
+	if h, ok := mux.entries[path]; ok {
+		return h, path
+	}
+	// Subtree match: patterns ending in "/" match any subpath (Go stdlib behavior)
+	longest := ""
+	var matched Handler
+	for p, h := range mux.entries {
+		if len(p) > 0 && p[len(p)-1] == '/' && len(p) <= len(path) && path[:len(p)] == p {
+			if len(p) > len(longest) {
+				longest = p
+				matched = h
+			}
+		}
+	}
+	if matched != nil {
+		return matched, longest
 	}
 	return NotFoundHandler(), ""
 }
