@@ -14,16 +14,16 @@ description: GoMode performance vs native Go and standard Go WASM.
 
 | | Native Go | GoMode (Worker) | GoMode (DO) | Std Go WASM |
 |---|---|---|---|---|
-| **GET / req/sec** | 80,715 | 3,159 | 1,235 | 614 |
-| **GET /json req/sec** | 83,182 | 3,181 | 961 | 537 |
-| **Latency (avg)** | 0.6ms | 4.5ms | 9.7ms | 78ms |
+| **GET / req/sec** | 80,715 | 3,145 | 1,465 | 614 |
+| **GET /json req/sec** | 83,182 | 3,454 | 1,478 | 537 |
+| **Latency (avg)** | 0.6ms | 3.8ms | 9.0ms | 78ms |
 | **Binary size** | native | 753KB | 753KB | 3.0MB |
 
 > **Note:** GoMode numbers are bottlenecked by wrangler dev (~3.5K req/sec ceiling). Production CF edge numbers will be significantly higher. We'll update these with production benchmarks soon.
 
 ## GoMode vs Standard Go WASM
 
-**5.6x faster** throughput with a **4x smaller** binary.
+**6.4x faster** throughput with a **4x smaller** binary.
 
 The standard Go compiler produces a 3MB WASM binary with a heavy runtime (goroutine scheduler, full GC, large stdlib). TinyGo produces a 753KB binary with minimal runtime. GoMode uses zerobuf for zero-copy data exchange — no JSON serialization anywhere in the hot path.
 
@@ -40,7 +40,7 @@ Compare to standard Go WASM which requires `JSON.stringify` → encode → copy 
 
 ## Worker vs Durable Object
 
-Worker mode is **2.6x faster** than DO mode because:
+Worker mode is **2.3x faster** than DO mode because:
 
 - **No DO queue** — requests don't serialize through a single instance
 - **Horizontal scaling** — CF spins up multiple isolates, each with its own cached WASM instance
