@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install TinyGo
+        run: |
+          wget -q https://github.com/tinygo-org/tinygo/releases/download/v0.40.1/tinygo_0.40.1_amd64.deb -O /tmp/tinygo.deb
+          sudo dpkg -i /tmp/tinygo.deb
+          tinygo version
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build Zig ABI
+        run: npm run build:zig
+
+      - name: Build Go + Zig WASM
+        run: npm run build:go
+
+      - name: Start dev server and run tests
+        run: |
+          cd worker && npx wrangler dev --port 8787 &
+          sleep 5
+          cd ..
+          npm test
