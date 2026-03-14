@@ -1,14 +1,30 @@
 /**
- * GoDO — Durable Object that runs TinyGo + Zig WASM.
+ * GoDO — Durable Object with fast path direct memory access.
  *
- * Single WASM binary: TinyGo + Zig linked via wasm-ld.
- * WASM instance created once and kept alive for the DO lifetime.
+ * Same optimizations as worker.ts: direct DataView writes/reads,
+ * no zerobuf schema objects, pre-encoded methods.
  */
 
 import goWasmModule from "./go.wasm";
-import { Arena, defineSchema } from "zerobuf";
 
 const textDecoder = new TextDecoder();
+const textEncoder = new TextEncoder();
+
+const VALUE_SLOT = 16;
+const TAG_STRING = 4;
+const STRING_HEADER = 4;
+
+const METHOD_BYTES: Record<string, Uint8Array> = {
+  GET: new Uint8Array([71, 69, 84]),
+  POST: new Uint8Array([80, 79, 83, 84]),
+  PUT: new Uint8Array([80, 85, 84]),
+  DELETE: new Uint8Array([68, 69, 76, 69, 84, 69]),
+  PATCH: new Uint8Array([80, 65, 84, 67, 72]),
+  HEAD: new Uint8Array([72, 69, 65, 68]),
+  OPTIONS: new Uint8Array([79, 80, 84, 73, 79, 78, 83]),
+};
+
+// Scratch space allocated per DO instance after WASM init
 
 interface Env {
   [key: string]: unknown;
@@ -18,17 +34,27 @@ interface GoWasmExports {
   memory: WebAssembly.Memory;
   _start: () => void;
   handle_zerobuf: (reqBase: number) => number;
+  malloc: (size: number) => number;
 }
 
-const RequestSchema = defineSchema<{ method: string; path: string }>(["method", "path"]);
-const ResponseSchema = defineSchema<{ status: number; contentType: string; body: string }>(["status", "contentType", "body"]);
+function writeStringSlot(
+  mem: DataView, u8: Uint8Array,
+  slotOffset: number, dataOffset: number,
+  bytes: Uint8Array
+): number {
+  mem.setUint32(dataOffset, bytes.byteLength, true);
+  u8.set(bytes, dataOffset + STRING_HEADER);
+  mem.setUint8(slotOffset, TAG_STRING);
+  mem.setUint32(slotOffset + 4, dataOffset, true);
+  return (dataOffset + STRING_HEADER + bytes.byteLength + 3) & ~3;
+}
 
 export class GoDO implements DurableObject {
   private state: DurableObjectState;
   private env: Env;
   private wasmExports: GoWasmExports | null = null;
   private initPromise: Promise<void> | null = null;
-  private arena: Arena | null = null;
+  private reqScratch = 0;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -50,6 +76,8 @@ export class GoDO implements DurableObject {
         throw e;
       }
     }
+
+    this.reqScratch = this.wasmExports.malloc(256);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -61,33 +89,42 @@ export class GoDO implements DurableObject {
     }
 
     const exports = this.wasmExports!;
+    const url = request.url;
+    const schemeEnd = url.indexOf("//");
+    const pathStart = schemeEnd === -1 ? 0 : url.indexOf("/", schemeEnd + 2);
+    const queryStart = url.indexOf("?", pathStart === -1 ? 0 : pathStart);
+    const pathname = pathStart === -1 ? "/" :
+      queryStart === -1 ? url.slice(pathStart) : url.slice(pathStart, queryStart);
 
-    if (!this.arena) {
-      this.arena = new Arena(exports.memory, 1024 * 1024);
-    }
+    const memory = exports.memory;
+    const buf = memory.buffer;
+    const mem = new DataView(buf);
+    const u8 = new Uint8Array(buf);
 
-    const checkpoint = this.arena.save();
+    let dataOffset = this.reqScratch + 2 * VALUE_SLOT;
 
-    try {
-      const url = new URL(request.url);
+    const methodBytes = METHOD_BYTES[request.method] || textEncoder.encode(request.method);
+    dataOffset = writeStringSlot(mem, u8, this.reqScratch, dataOffset, methodBytes);
 
-      const req = RequestSchema.create(this.arena, {
-        method: request.method,
-        path: url.pathname,
-      });
+    const pathBytes = textEncoder.encode(pathname);
+    dataOffset = writeStringSlot(mem, u8, this.reqScratch + VALUE_SLOT, dataOffset, pathBytes);
 
-      const reqPtr = (req as unknown as { __zerobuf_ptr: number }).__zerobuf_ptr;
-      const respPtr = exports.handle_zerobuf(reqPtr);
+    const respPtr = exports.handle_zerobuf(this.reqScratch);
 
-      const resp = ResponseSchema.toJS(this.arena, respPtr);
+    const status = mem.getInt32(respPtr + 4, true);
 
-      return new Response(resp.body, {
-        status: resp.status,
-        headers: { "content-type": resp.contentType },
-      });
-    } finally {
-      this.arena.restore(checkpoint);
-    }
+    const ctPtr = mem.getUint32(respPtr + VALUE_SLOT + 4, true);
+    const ctLen = mem.getUint32(ctPtr, true);
+    const contentType = textDecoder.decode(new Uint8Array(buf, ctPtr + STRING_HEADER, ctLen));
+
+    const bodyPtr = mem.getUint32(respPtr + 2 * VALUE_SLOT + 4, true);
+    const bodyLen = mem.getUint32(bodyPtr, true);
+    const body = textDecoder.decode(new Uint8Array(buf, bodyPtr + STRING_HEADER, bodyLen));
+
+    return new Response(body, {
+      status,
+      headers: { "content-type": contentType },
+    });
   }
 
   private buildWasiImports(): Record<string, WebAssembly.ImportValue> {

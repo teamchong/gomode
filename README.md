@@ -10,7 +10,7 @@ Standard Go → WASM produces 3MB+ binaries with a heavy runtime. TinyGo produce
 |---|---|---|---|---|
 | Go → WASM | 3MB+ | Full | Slow | Slow (heavy runtime) |
 | TinyGo → WASM | ~700KB | Incomplete | Fast | Fast |
-| **GoMode** | **79KB** | **Zig fills gaps (SIMD, crypto)** | **Fast** | **Fast (zero-copy)** |
+| **GoMode** | **58KB** | **Zig fills gaps (SIMD, crypto, allocator)** | **Fast** | **Fast (zero-copy)** |
 
 ## How it works
 
@@ -88,11 +88,11 @@ All benchmarks on wrangler dev (local miniflare). Wrangler caps at ~3.7K req/sec
 | **GET / req/sec** | 80,715 | 3,764 | 1,586 | 614 |
 | **GET /simd req/sec** | — | 3,692 | 1,574 | — |
 | **Latency (avg)** | 0.6ms | 3.2ms | 7.2ms | 78ms |
-| **Binary size** | native | 79KB | 79KB | 3.0MB |
+| **Binary size** | native | 58KB | 58KB | 3.0MB |
 
-**6.1x faster** than standard Go WASM. **38x smaller** binary.
+**6.1x faster** than standard Go WASM. **52x smaller** binary.
 
-SIMD route (Go calling Zig SIMD sum/dot/scale/minmax) runs at the same throughput as hello world — confirming zero overhead.
+SIMD route (Go calling Zig SIMD sum/dot/scale/minmax) runs at the same throughput as hello world — confirming zero overhead. Binary is 58KB with Zig bump allocator (`-gc=custom`).
 
 ## Two modes
 
@@ -112,9 +112,11 @@ worker/src/
 zig-abi/src/
   main.zig          — Memory mgmt + SIMD exports
   simd.zig          — WASM SIMD v128 batch operations
+  allocator.zig     — Bump allocator (replaces Go's GC)
 
 go-sdk/
   gomode.go         — CGo wrappers for Zig functions
+  gc.go             — Custom GC bridge (routes runtime.alloc to Zig malloc)
   zig_abi.h         — C header declaring Zig exports
 
 examples/
@@ -128,9 +130,11 @@ examples/
 - [x] Zig SIMD (sum, dot, scale, add, minmax) callable from Go
 - [x] Worker + Durable Object modes
 - [x] CGo FFI — Go calls Zig as direct WASM calls
-- [ ] Zig crypto polyfill (TLS, hashing)
-- [ ] Zig HTTP parsing polyfill
-- [ ] Asyncify for async CF bindings (KV, R2, D1)
+- [x] Zig bump allocator replacing Go's GC (`-gc=custom`)
+- [x] Fan-out architecture — JS fetches async data in parallel, WASM stays pure compute
+- [ ] Zig crypto (hashing, TLS)
+- [ ] Zig HTTP parsing
+- [ ] Worker RPC for parallel compute (service bindings)
 - [ ] Production CF edge benchmarks
 
 ## Related

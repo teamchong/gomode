@@ -3,7 +3,7 @@ title: gomode
 description: Go on Cloudflare Workers — fast, small, complete.
 template: splash
 hero:
-  tagline: TinyGo + Zig in a single WASM binary. 79KB, SIMD, zero-copy, zero overhead.
+  tagline: TinyGo + Zig in a single WASM binary. 58KB, SIMD, zero-copy, zero overhead.
   actions:
     - text: Get Started
       link: /gomode/getting-started/
@@ -30,8 +30,11 @@ Standard Go gives you the full stdlib but a massive binary with a heavy runtime.
 Use TinyGo for the small binary, use **Zig to fill every gap** — linked into the same WASM binary via `wasm-ld`. Zero runtime overhead.
 
 ```
-Zig (SIMD, memory, crypto polyfills) ──→ zig-abi.o
-Go handler (TinyGo, CGo) ─────────────→ wasm-ld → go.wasm (79KB)
+Zig (SIMD, allocator, crypto) ──────────→ zig-abi.o
+Go handler (TinyGo, CGo, -gc=custom) ──→ wasm-ld → go.wasm (58KB)
+
+JS Worker writes/reads via zerobuf layout (direct DataView on hot path)
+
 ```
 
 Go calls Zig via CGo — compiles to direct WASM `call` instructions. Same linear memory, no imports, no JS proxy, no serialization.

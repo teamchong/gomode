@@ -1,34 +1,56 @@
 /**
- * GoMode Worker — Two modes:
+ * GoMode Worker — Fan-out architecture.
+ *
+ * JS orchestrates all async work (fetch, KV, R2) in parallel,
+ * writes results into WASM memory, then calls the Go handler
+ * with everything pre-fetched. WASM stays pure compute.
+ *
  *   /do/*  → Durable Object (stateful, persistent WASM instance)
  *   /*     → Direct WASM execution (stateless, max concurrency)
- *
- * Single WASM binary: TinyGo + Zig linked via wasm-ld.
- * Go calls Zig SIMD directly — internal function calls, zero overhead.
  */
 
 export { GoDO } from "./go-do";
 import goWasmModule from "./go.wasm";
-import { Arena, defineSchema } from "zerobuf";
 
 const textDecoder = new TextDecoder();
+const textEncoder = new TextEncoder();
+
+// zerobuf constants
+const VALUE_SLOT = 16;
+const TAG_I32 = 2;
+const TAG_STRING = 4;
+const TAG_BYTES = 8;
+const STRING_HEADER = 4;
+
+// Pre-encoded HTTP methods
+const METHOD_BYTES: Record<string, Uint8Array> = {
+  GET: new Uint8Array([71, 69, 84]),
+  POST: new Uint8Array([80, 79, 83, 84]),
+  PUT: new Uint8Array([80, 85, 84]),
+  DELETE: new Uint8Array([68, 69, 76, 69, 84, 69]),
+  PATCH: new Uint8Array([80, 65, 84, 67, 72]),
+  HEAD: new Uint8Array([72, 69, 65, 68]),
+  OPTIONS: new Uint8Array([79, 80, 84, 73, 79, 78, 83]),
+};
 
 interface Env {
   GO_DO: DurableObjectNamespace;
+  [key: string]: unknown;
 }
 
 interface GoWasmExports {
   memory: WebAssembly.Memory;
   _start: () => void;
   handle_zerobuf: (reqBase: number) => number;
+  malloc: (size: number) => number;
 }
-
-const RequestSchema = defineSchema<{ method: string; path: string }>(["method", "path"]);
-const ResponseSchema = defineSchema<{ status: number; contentType: string; body: string }>(["status", "contentType", "body"]);
 
 let wasmExports: GoWasmExports | null = null;
 let initPromise: Promise<void> | null = null;
-let zbArena: Arena | null = null;
+let reqScratch = 0;
+
+// Max request scratch: 8 slots (method, path, body, + 5 fan-out results) + 4KB data
+const REQ_SCRATCH_SIZE = 8 * VALUE_SLOT + 4096;
 
 function buildWasiImports(
   getMemory: () => WebAssembly.Memory
@@ -119,6 +141,8 @@ async function initWasm(): Promise<void> {
     const msg = e instanceof Error ? e.message : String(e);
     if (!msg.includes("exit code: 0") && !msg.includes("proc_exit")) throw e;
   }
+
+  reqScratch = wasmExports.malloc(REQ_SCRATCH_SIZE);
 }
 
 async function ensureWasm(): Promise<GoWasmExports> {
@@ -129,47 +153,225 @@ async function ensureWasm(): Promise<GoWasmExports> {
   return wasmExports!;
 }
 
-async function handleRequest(request: Request, pathname: string): Promise<Response> {
-  const exports = await ensureWasm();
+// ============================================================================
+// Zerobuf slot writers — write directly into WASM memory
+// ============================================================================
 
-  if (!zbArena) {
-    zbArena = new Arena(exports.memory, 1024 * 1024);
+/** Write a string slot. Returns next aligned data offset. */
+function writeStringSlot(
+  mem: DataView, u8: Uint8Array,
+  slotOffset: number, dataOffset: number,
+  bytes: Uint8Array
+): number {
+  mem.setUint32(dataOffset, bytes.byteLength, true);
+  u8.set(bytes, dataOffset + STRING_HEADER);
+  mem.setUint8(slotOffset, TAG_STRING);
+  mem.setUint32(slotOffset + 4, dataOffset, true);
+  return (dataOffset + STRING_HEADER + bytes.byteLength + 3) & ~3;
+}
+
+/** Write a bytes slot (for fan-out results). Returns next aligned data offset. */
+function writeBytesSlot(
+  mem: DataView, u8: Uint8Array,
+  slotOffset: number, dataOffset: number,
+  data: Uint8Array
+): number {
+  mem.setUint32(dataOffset, data.byteLength, true);
+  u8.set(data, dataOffset + STRING_HEADER);
+  mem.setUint8(slotOffset, TAG_BYTES);
+  mem.setUint32(slotOffset + 4, dataOffset, true);
+  return (dataOffset + STRING_HEADER + data.byteLength + 3) & ~3;
+}
+
+/** Write an i32 slot. */
+function writeI32Slot(mem: DataView, slotOffset: number, value: number): void {
+  mem.setUint8(slotOffset, TAG_I32);
+  mem.setInt32(slotOffset + 4, value, true);
+}
+
+// ============================================================================
+// Request builder — writes zerobuf request with optional fan-out data
+// ============================================================================
+
+/**
+ * Fan-out data item. JS fetches these in parallel before calling WASM.
+ * Each becomes a zerobuf slot in the request that Go can read.
+ */
+interface FanOutItem {
+  type: "string" | "bytes" | "i32";
+  value: string | Uint8Array | number;
+}
+
+/**
+ * Build a zerobuf request in WASM memory.
+ *
+ * Slot layout:
+ *   [0] method (string)
+ *   [1] path (string)
+ *   [2] body (string, from request body)
+ *   [3..N] fan-out results (string/bytes/i32)
+ *
+ * Go handler reads slots by index — slot 3 is the first fan-out result.
+ */
+function buildRequest(
+  exports: GoWasmExports,
+  method: string, pathname: string,
+  body?: string | null,
+  fanout?: FanOutItem[]
+): number {
+  const memory = exports.memory;
+  const buf = memory.buffer;
+  const mem = new DataView(buf);
+  const u8 = new Uint8Array(buf);
+
+  const numSlots = 3 + (fanout?.length ?? 0);
+  let dataOffset = reqScratch + numSlots * VALUE_SLOT;
+
+  // Slot 0: method
+  const methodBytes = METHOD_BYTES[method] || textEncoder.encode(method);
+  dataOffset = writeStringSlot(mem, u8, reqScratch, dataOffset, methodBytes);
+
+  // Slot 1: path
+  const pathBytes = textEncoder.encode(pathname);
+  dataOffset = writeStringSlot(mem, u8, reqScratch + VALUE_SLOT, dataOffset, pathBytes);
+
+  // Slot 2: body (empty string if no body)
+  const bodyBytes = body ? textEncoder.encode(body) : new Uint8Array(0);
+  dataOffset = writeStringSlot(mem, u8, reqScratch + 2 * VALUE_SLOT, dataOffset, bodyBytes);
+
+  // Slots 3+: fan-out results
+  if (fanout) {
+    for (let i = 0; i < fanout.length; i++) {
+      const slot = reqScratch + (3 + i) * VALUE_SLOT;
+      const item = fanout[i];
+      if (item.type === "string") {
+        const bytes = textEncoder.encode(item.value as string);
+        dataOffset = writeStringSlot(mem, u8, slot, dataOffset, bytes);
+      } else if (item.type === "bytes") {
+        dataOffset = writeBytesSlot(mem, u8, slot, dataOffset, item.value as Uint8Array);
+      } else {
+        writeI32Slot(mem, slot, item.value as number);
+      }
+    }
   }
 
-  const checkpoint = zbArena.save();
+  return reqScratch;
+}
 
-  try {
-    const req = RequestSchema.create(zbArena, {
-      method: request.method,
-      path: pathname,
-    });
+/** Read response from WASM memory. */
+function readResponse(exports: GoWasmExports, respPtr: number): Response {
+  const buf = exports.memory.buffer;
+  const mem = new DataView(buf);
 
-    const reqPtr = (req as unknown as { __zerobuf_ptr: number }).__zerobuf_ptr;
-    const respPtr = exports.handle_zerobuf(reqPtr);
+  const status = mem.getInt32(respPtr + 4, true);
 
-    const resp = ResponseSchema.toJS(zbArena, respPtr);
+  const ctPtr = mem.getUint32(respPtr + VALUE_SLOT + 4, true);
+  const ctLen = mem.getUint32(ctPtr, true);
+  const contentType = textDecoder.decode(new Uint8Array(buf, ctPtr + STRING_HEADER, ctLen));
 
-    return new Response(resp.body, {
-      status: resp.status,
-      headers: { "content-type": resp.contentType },
-    });
-  } finally {
-    zbArena.restore(checkpoint);
+  const bodyPtr = mem.getUint32(respPtr + 2 * VALUE_SLOT + 4, true);
+  const bodyLen = mem.getUint32(bodyPtr, true);
+  const body = textDecoder.decode(new Uint8Array(buf, bodyPtr + STRING_HEADER, bodyLen));
+
+  return new Response(body, {
+    status,
+    headers: { "content-type": contentType },
+  });
+}
+
+// ============================================================================
+// Fan-out: JS does all async work, passes results to WASM
+// ============================================================================
+
+/**
+ * Route handler with fan-out support.
+ *
+ * Define routes that need async data. JS fetches everything in parallel,
+ * then calls WASM with all data pre-loaded. WASM does pure compute.
+ *
+ * Example usage in a real app:
+ *   /api/dashboard → fan-out to [KV.get("user"), fetch(analyticsAPI), D1.query("SELECT...")]
+ *                  → all 3 resolve in parallel
+ *                  → WASM receives 3 extra slots with the results
+ *                  → Go handler transforms/combines data, returns response
+ */
+async function handleWithFanout(
+  exports: GoWasmExports,
+  request: Request,
+  pathname: string,
+  env: Env
+): Promise<Response> {
+  // Fan-out: fetch all async data needed for this route in parallel
+  const fanout = await resolveFanout(pathname, request, env);
+
+  // Read request body if present
+  let body: string | null = null;
+  if (request.method === "POST" || request.method === "PUT" || request.method === "PATCH") {
+    body = await request.text();
   }
+
+  // Build request with fan-out results already in WASM memory
+  const reqPtr = buildRequest(exports, request.method, pathname, body, fanout);
+
+  // Call WASM — pure compute, no async, no blocking
+  const respPtr = exports.handle_zerobuf(reqPtr);
+
+  return readResponse(exports, respPtr);
+}
+
+/**
+ * Resolve fan-out data for a route. Override this for your app's routes.
+ * Returns an array of pre-fetched data items that become zerobuf slots 3+.
+ *
+ * All promises run in parallel via Promise.all.
+ */
+async function resolveFanout(
+  _pathname: string,
+  _request: Request,
+  _env: Env
+): Promise<FanOutItem[] | undefined> {
+  // No fan-out needed for the example routes.
+  // Real app would match routes and fetch data:
+  //
+  // if (pathname === "/api/dashboard") {
+  //   const [user, stats] = await Promise.all([
+  //     env.KV.get("user:123"),
+  //     fetch("https://api.example.com/stats").then(r => r.text()),
+  //   ]);
+  //   return [
+  //     { type: "string", value: user ?? "" },
+  //     { type: "string", value: stats },
+  //   ];
+  // }
+  return undefined;
+}
+
+// ============================================================================
+// Entry point
+// ============================================================================
+
+function extractPathname(url: string): string {
+  const schemeEnd = url.indexOf("//");
+  if (schemeEnd === -1) return url;
+  const pathStart = url.indexOf("/", schemeEnd + 2);
+  if (pathStart === -1) return "/";
+  const queryStart = url.indexOf("?", pathStart);
+  return queryStart === -1 ? url.slice(pathStart) : url.slice(pathStart, queryStart);
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
+    const pathname = extractPathname(request.url);
 
-    if (url.pathname.startsWith("/do/")) {
+    if (pathname.startsWith("/do/")) {
       const id = env.GO_DO.idFromName("singleton");
       const durable = env.GO_DO.get(id);
-      const innerUrl = new URL(request.url);
-      innerUrl.pathname = url.pathname.slice(3) || "/";
-      return durable.fetch(new Request(innerUrl.toString(), request));
+      const innerPath = pathname.slice(3) || "/";
+      const innerUrl = request.url.replace(pathname, innerPath);
+      return durable.fetch(new Request(innerUrl, request));
     }
 
-    return handleRequest(request, url.pathname);
+    const exports = await ensureWasm();
+    return handleWithFanout(exports, request, pathname, env);
   },
 };

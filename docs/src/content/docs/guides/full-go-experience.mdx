@@ -1,0 +1,385 @@
+---
+title: The Full Go Experience
+description: Everything you need to write production Go on Cloudflare Workers with GoMode.
+---
+
+## What GoMode gives you
+
+GoMode is a complete Go runtime for Cloudflare Workers. Write Go, get a 58KB WASM binary that runs at the edge with SIMD, zero-copy I/O, and a Zig bump allocator replacing Go's GC.
+
+### Go feature mapping
+
+| What you'd normally use | GoMode equivalent | How it works |
+|---|---|---|
+| `net/http` | `handle_zerobuf` | zerobuf request/response in shared WASM memory |
+| `encoding/json` | zerobuf slots | Zero-copy — no marshal/unmarshal, direct memory reads |
+| Go's GC | Zig bump allocator | `-gc=custom`, O(1) pointer bump, `ZigHeapReset()` between requests |
+| `crypto/*` | Zig crypto | Zig fills TinyGo's missing crypto via CGo (same binary) |
+| `go func()` / channels | Fan-out + Worker RPC | JS runs async in parallel, WASM stays pure compute |
+| SIMD / vectorized math | Zig SIMD v128 | `gomode.ZigSimdSumF64()` etc — direct WASM call, zero overhead |
+| `database/sql` | Fan-out to D1/KV/R2 | JS fetches from CF bindings, passes results as zerobuf slots |
+| `http.Get()` | Fan-out from JS | JS does `fetch()` in parallel, passes response to WASM |
+| Global state | `main()` init + DO mode | `main()` runs once; DO mode keeps WASM alive with persistent state |
+
+### The data protocol: zerobuf
+
+All data between JS and Go flows through **zerobuf** — a zero-copy tagged value layout in shared WASM memory. No JSON anywhere.
+
+Each field is a 16-byte slot: `[tag:u8][pad:3][payloadA:u32][payloadB:f64]`
+
+Tags: `0=null, 1=bool, 2=i32, 3=f64, 4=string, 8=bytes`
+
+Strings are stored as `[byteLen:u32][utf8 bytes...]` with a pointer in the slot payload.
+
+The JS Worker writes zerobuf slots directly into WASM memory via `DataView`, Go reads them at fixed offsets — no parsing, no serialization, no copying.
+
+## Writing a handler
+
+Every GoMode app exports one function: `handle_zerobuf`. The Worker calls it for every request.
+
+```go
+package main
+
+import (
+	"gomode"
+	"unsafe"
+)
+
+const (
+	tagI32       = 2
+	tagString    = 4
+	valueSlot    = 16
+	stringHeader = 4
+)
+
+var respBuf [560]byte
+
+//export handle_zerobuf
+func handleZerobuf(reqBase uint32) uint32 {
+	reqAddr := uintptr(reqBase)
+
+	method := readZBString(reqAddr + 0*valueSlot)
+	path   := readZBString(reqAddr + 1*valueSlot)
+	body   := readZBString(reqAddr + 2*valueSlot)
+
+	switch path {
+	case "/":
+		return writeResponse(200, "text/plain", "Hello from GoMode!")
+	case "/echo":
+		return writeResponse(200, "text/plain", method+" "+path+": "+body)
+	default:
+		return writeResponse(404, "text/plain", "not found")
+	}
+}
+
+func main() {}
+```
+
+### Request layout
+
+The Worker writes request fields as zerobuf tagged value slots into WASM memory before calling your handler:
+
+| Slot | Offset | Field | Type |
+|---|---|---|---|
+| 0 | `reqBase + 0*16` | method | string ("GET", "POST", ...) |
+| 1 | `reqBase + 1*16` | path | string ("/api/users") |
+| 2 | `reqBase + 2*16` | body | string (request body text) |
+| 3+ | `reqBase + 3*16` | fan-out results | string/bytes/i32 |
+
+### Response layout
+
+Write your response into a static buffer and return its pointer:
+
+| Slot | Field | Type |
+|---|---|---|
+| 0 | status | i32 (200, 404, 500...) |
+| 1 | contentType | string |
+| 2 | body | string |
+
+The static `respBuf` pattern eliminates all per-request allocation:
+
+```go
+var respBuf [560]byte
+
+func writeResponse(status int32, contentType string, body string) uint32 {
+	base := uintptr(unsafe.Pointer(&respBuf[0]))
+
+	// Slot 0: status (i32)
+	*(*uint8)(unsafe.Pointer(base)) = tagI32
+	*(*int32)(unsafe.Pointer(base + 4)) = status
+
+	dataOffset := uintptr(48) // after 3 slots
+
+	// Slot 1: contentType
+	ctPtr := base + dataOffset
+	*(*uint32)(unsafe.Pointer(ctPtr)) = uint32(len(contentType))
+	copy(unsafe.Slice((*byte)(unsafe.Pointer(ctPtr+stringHeader)), len(contentType)), contentType)
+	*(*uint8)(unsafe.Pointer(base + valueSlot)) = tagString
+	*(*uint32)(unsafe.Pointer(base + valueSlot + 4)) = uint32(ctPtr)
+	dataOffset += stringHeader + uintptr(len(contentType))
+	dataOffset = (dataOffset + 3) &^ 3
+
+	// Slot 2: body
+	bodyPtr := base + dataOffset
+	*(*uint32)(unsafe.Pointer(bodyPtr)) = uint32(len(body))
+	copy(unsafe.Slice((*byte)(unsafe.Pointer(bodyPtr+stringHeader)), len(body)), body)
+	*(*uint8)(unsafe.Pointer(base + 2*valueSlot)) = tagString
+	*(*uint32)(unsafe.Pointer(base + 2*valueSlot + 4)) = uint32(bodyPtr)
+
+	return uint32(base)
+}
+```
+
+## Memory: Zig bump allocator
+
+GoMode replaces Go's garbage collector with a Zig bump allocator. Every `make()`, `new()`, string concat, and slice append goes through Zig's `malloc` instead of Go's GC.
+
+```
+Go code: s := "hello " + name
+  → runtime.alloc(size)
+    → C.malloc(size)           // CGo FFI
+      → Zig bump allocator     // O(1) pointer bump, no GC
+```
+
+Build with `-gc=custom -tags=custommalloc`:
+
+- Zero GC pauses
+- O(1) allocation (pointer bump)
+- `gomode.ZigHeapReset()` resets all allocations between requests
+- `gomode.ZigHeapUsed()` / `gomode.ZigHeapCapacity()` for monitoring
+
+For short-lived request handlers, the bump allocator is ideal: allocate during the request, reset at the end. No fragmentation, no GC sweep.
+
+## SIMD via Zig
+
+Go can call Zig SIMD functions directly. These compile to WASM v128 SIMD instructions — same binary, direct `call`, zero overhead.
+
+```go
+import "gomode"
+
+func handleAnalytics() uint32 {
+	prices := []float64{142.5, 143.2, 141.8, 144.0, 143.5, 142.9, 144.2, 145.0}
+	ptr := uint32(uintptr(unsafe.Pointer(&prices[0])))
+	count := uint32(len(prices))
+
+	sum := gomode.ZigSimdSumF64(ptr, count)
+	dot := gomode.ZigSimdDotF64(ptr, ptr, count)
+
+	var minmax [2]float64
+	outPtr := uint32(uintptr(unsafe.Pointer(&minmax[0])))
+	gomode.ZigSimdMinmaxF64(ptr, count, outPtr)
+
+	gomode.ZigSimdScaleF64(ptr, count, 1.05) // scale in-place
+
+	return writeResponse(200, "application/json",
+		`{"sum":`+formatFloat(sum)+
+		`,"dot":`+formatFloat(dot)+
+		`,"min":`+formatFloat(minmax[0])+
+		`,"max":`+formatFloat(minmax[1])+`}`)
+}
+```
+
+Available SIMD operations:
+
+| Function | Description |
+|---|---|
+| `ZigSimdSumF64(ptr, count)` | Sum of f64 array |
+| `ZigSimdSumI32(ptr, count)` | Sum of i32 array |
+| `ZigSimdDotF64(a, b, count)` | Dot product of two f64 arrays |
+| `ZigSimdScaleF64(ptr, count, scalar)` | Multiply f64 array by scalar (in-place) |
+| `ZigSimdAddF64(dst, a, b, count)` | Element-wise addition |
+| `ZigSimdMinmaxF64(ptr, count, out)` | Min and max in one pass |
+
+## Async I/O: the fan-out pattern
+
+Go on WASM can't do async. GoMode solves this with fan-out: JS fetches all async data in parallel *before* calling WASM, then passes the results as extra zerobuf slots.
+
+```
+Browser → CF Worker (JS)
+  → Promise.all([KV.get("user"), fetch(api), D1.query(sql)])
+  → writes results into WASM memory as slots 3, 4, 5
+  → calls handle_zerobuf(reqPtr)
+  → Go reads slot 3 = user data, slot 4 = API response, slot 5 = DB rows
+  → Go transforms/combines, writes response
+  → CF Response
+```
+
+### JS side: define fan-out per route
+
+In `worker/src/worker.ts`, the `resolveFanout` function maps routes to async data sources:
+
+```typescript
+async function resolveFanout(
+  pathname: string,
+  request: Request,
+  env: Env
+): Promise<FanOutItem[] | undefined> {
+  if (pathname === "/api/dashboard") {
+    const [user, stats, orders] = await Promise.all([
+      env.KV.get("user:123"),
+      fetch("https://api.example.com/stats").then(r => r.text()),
+      env.DB.prepare("SELECT count(*) FROM orders").first(),
+    ]);
+    return [
+      { type: "string", value: user ?? "" },
+      { type: "string", value: stats },
+      { type: "string", value: JSON.stringify(orders) },
+    ];
+  }
+  return undefined;
+}
+```
+
+### Go side: read fan-out results from slots 3+
+
+```go
+//export handle_zerobuf
+func handleZerobuf(reqBase uint32) uint32 {
+	reqAddr := uintptr(reqBase)
+	path := readZBString(reqAddr + 1*valueSlot)
+
+	switch path {
+	case "/api/dashboard":
+		user   := readZBString(reqAddr + 3*valueSlot) // fan-out slot 0
+		stats  := readZBString(reqAddr + 4*valueSlot) // fan-out slot 1
+		orders := readZBString(reqAddr + 5*valueSlot) // fan-out slot 2
+
+		// Pure compute: transform, combine, format
+		return writeResponse(200, "application/json",
+			`{"user":`+user+`,"stats":`+stats+`,"orders":`+orders+`}`)
+	}
+	return writeResponse(404, "text/plain", "not found")
+}
+```
+
+WASM stays pure compute. All async (KV, fetch, D1, R2) happens in JS, in parallel, before WASM is called.
+
+## Concurrency: Worker RPC instead of goroutines
+
+Go channels and goroutines don't exist in WASM (`-scheduler=none`). GoMode replaces them with Worker RPC via CF service bindings — each service binding is an independent WASM instance.
+
+```
+Main Worker → Service Binding A (WASM instance)  → compute chunk 1
+            → Service Binding B (WASM instance)  → compute chunk 2
+            → Service Binding C (WASM instance)  → compute chunk 3
+            → Promise.all([A, B, C])              → combine results
+```
+
+Each service binding gets its own isolate. CF handles concurrency — no goroutines needed. This is like Go channels, but across edge instances instead of OS threads.
+
+### Define service bindings in wrangler.toml
+
+```toml
+[[services]]
+binding = "COMPUTE_A"
+service = "gomode-worker"
+
+[[services]]
+binding = "COMPUTE_B"
+service = "gomode-worker"
+```
+
+### Fan out to multiple WASM instances
+
+```typescript
+// In worker.ts resolveFanout:
+if (pathname === "/api/parallel-compute") {
+  const [resultA, resultB] = await Promise.all([
+    env.COMPUTE_A.fetch("http://internal/chunk-a"),
+    env.COMPUTE_B.fetch("http://internal/chunk-b"),
+  ]);
+  return [
+    { type: "bytes", value: new Uint8Array(await resultA.arrayBuffer()) },
+    { type: "bytes", value: new Uint8Array(await resultB.arrayBuffer()) },
+  ];
+}
+```
+
+## Lifecycle: reactor model
+
+GoMode uses a **reactor model**:
+
+1. `main()` runs once when WASM loads — initialize globals, lookup tables, config
+2. `handle_zerobuf()` is called for every request — read request, compute, write response
+3. WASM instance stays alive (cached per isolate in Worker mode, persistent in DO mode)
+
+```go
+// Global state — initialized once
+var router map[string]func() uint32
+
+func main() {
+	router = map[string]func() uint32{
+		"/":     handleRoot,
+		"/simd": handleSimd,
+	}
+}
+
+//export handle_zerobuf
+func handleZerobuf(reqBase uint32) uint32 {
+	path := readZBString(uintptr(reqBase) + 1*valueSlot)
+	if handler, ok := router[path]; ok {
+		return handler()
+	}
+	return writeResponse(404, "text/plain", "not found")
+}
+```
+
+## Two modes: Worker vs Durable Object
+
+| | Worker (`/*`) | Durable Object (`/do/*`) |
+|---|---|---|
+| State | Stateless | In-memory + durable storage |
+| Scaling | CF scales isolates horizontally | Single instance |
+| WASM lifetime | Cached per isolate | Alive for DO lifetime |
+| Use case | APIs, transforms, SIMD compute | Sessions, counters, websockets |
+
+Both use the same Go handler code. The routing is handled by JS:
+- `/*` routes go directly to WASM in the Worker isolate
+- `/do/*` routes go through a Durable Object that maintains a persistent WASM instance
+
+## Build your handler
+
+```bash
+# 1. Create handler directory
+mkdir my-handler && cd my-handler
+go mod init my-handler
+
+# 2. Add go-sdk dependency (in go.mod)
+#    require gomode v0.0.0
+#    replace gomode => ../go-sdk
+
+# 3. Write main.go (see handler template above)
+
+# 4. Build
+cd /path/to/gomode
+npm run build:zig                                    # Zig → zig-abi.o
+npx tsx scripts/build-tinygo.ts /path/to/my-handler  # Go + Zig → go.wasm
+
+# 5. Run
+npm run dev
+```
+
+## What's different from standard Go
+
+| Standard Go | GoMode | Why |
+|---|---|---|
+| `import "net/http"` | `handle_zerobuf` export | TinyGo doesn't support net/http on WASM |
+| `json.Marshal/Unmarshal` | zerobuf slot reads/writes | Zero-copy, no serialization |
+| `go func()` / channels | Fan-out + Worker RPC | `-scheduler=none`, no goroutine runtime |
+| GC pauses | Zig bump allocator | `-gc=custom`, O(1) alloc, manual reset |
+| 3MB binary | 58KB binary | TinyGo + Zig, no heavy runtime |
+| `http.Get()` | Fan-out from JS | WASM can't do async I/O |
+| `crypto/sha256` | Zig crypto polyfill | TinyGo lacks crypto on WASM targets |
+
+## What you keep from Go
+
+- All Go syntax, types, structs, interfaces, methods
+- Standard control flow (if, for, switch, select-less)
+- Maps, slices, strings, string formatting
+- Math, sort, strconv, bytes, strings packages
+- Struct composition, embedding, type assertions
+- Error handling (`error` interface, multiple returns)
+- `unsafe` for direct memory access (needed for zerobuf)
+- Any pure-compute Go package that doesn't depend on unsupported stdlib
+
+The rule: if it compiles with TinyGo targeting `wasip1`, it works in GoMode. Plus you get Zig SIMD operations that standard Go doesn't have at all.
