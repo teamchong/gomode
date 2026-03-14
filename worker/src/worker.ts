@@ -305,7 +305,10 @@ function buildRequest(
 interface WasmResponse {
   status: number;
   contentType: string;
+  /** Body as string — only populated for two-phase fetch (status=-1) */
   body: string;
+  /** Body as bytes — zero-copy from WASM memory */
+  bodyBytes: Uint8Array;
   headers: Headers;
 }
 
@@ -322,7 +325,8 @@ function readRawResponse(exports: GoWasmExports, respPtr: number): WasmResponse 
 
   const bodyPtr = mem.getUint32(respPtr + 2 * VALUE_SLOT + 4, true);
   const bodyLen = mem.getUint32(bodyPtr, true);
-  const body = textDecoder.decode(new Uint8Array(buf, bodyPtr + STRING_HEADER, bodyLen));
+  // Copy body bytes out of WASM memory (buffer may be detached on next WASM call)
+  const bodyBytes = new Uint8Array(buf, bodyPtr + STRING_HEADER, bodyLen).slice();
 
   const respHeaders = new Headers();
   respHeaders.set("content-type", contentType);
@@ -345,13 +349,13 @@ function readRawResponse(exports: GoWasmExports, respPtr: number): WasmResponse 
     }
   }
 
-  return { status, contentType, body, headers: respHeaders };
+  return { status, contentType, body: "", bodyBytes, headers: respHeaders };
 }
 
 /** Convert raw response to a Web API Response object. */
 function toResponse(raw: WasmResponse): Response {
   const nullBodyStatus = raw.status === 101 || raw.status === 204 || raw.status === 205 || raw.status === 304;
-  return new Response(nullBodyStatus ? null : raw.body, { status: raw.status, headers: raw.headers });
+  return new Response(nullBodyStatus ? null : raw.bodyBytes, { status: raw.status, headers: raw.headers });
 }
 
 // ============================================================================
@@ -395,7 +399,7 @@ async function handleWithFanout(
   // Two-phase fetch: status=-1 means the handler needs an outbound fetch.
   // Body contains the fetch URL, content-type field contains the HTTP method.
   if (raw.status === -1) {
-    const fetchUrl = raw.body.trim();
+    const fetchUrl = textDecoder.decode(raw.bodyBytes).trim();
     const fetchMethod = raw.contentType.trim() || "GET";
 
     const fetchResp = await fetch(fetchUrl, { method: fetchMethod }).catch((err) =>

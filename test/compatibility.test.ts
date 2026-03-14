@@ -188,6 +188,42 @@ describe("Multiple w.Write calls", () => {
   });
 });
 
+describe("Large / streaming responses", () => {
+  it("returns 32KB response (exceeds old 16KB limit)", async () => {
+    const res = await fetch(`${BASE}/large?size=32768`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-body-size")).toBe("32768");
+    const buf = await res.arrayBuffer();
+    expect(buf.byteLength).toBe(32768);
+    // Verify content pattern
+    const bytes = new Uint8Array(buf);
+    expect(bytes[0]).toBe(65); // 'A'
+    expect(bytes[25]).toBe(90); // 'Z'
+    expect(bytes[26]).toBe(65); // wraps back to 'A'
+  });
+
+  it("returns 128KB response", async () => {
+    const res = await fetch(`${BASE}/large?size=131072`);
+    expect(res.status).toBe(200);
+    const buf = await res.arrayBuffer();
+    expect(buf.byteLength).toBe(131072);
+  });
+
+  it("returns 512KB response", async () => {
+    const res = await fetch(`${BASE}/large?size=524288`);
+    expect(res.status).toBe(200);
+    const buf = await res.arrayBuffer();
+    expect(buf.byteLength).toBe(524288);
+  });
+
+  it("returns default 32KB when no size param", async () => {
+    const res = await fetch(`${BASE}/large`);
+    expect(res.status).toBe(200);
+    const buf = await res.arrayBuffer();
+    expect(buf.byteLength).toBe(32768);
+  });
+});
+
 describe("Request reflection", () => {
   it("reflects all request properties", async () => {
     const res = await fetch(`${BASE}/reflect?foo=bar&baz=1`, {

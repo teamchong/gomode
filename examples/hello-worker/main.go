@@ -319,6 +319,25 @@ func main() {
 		})
 	})
 
+	// Large response — proves dynamic buffer works beyond old 16KB limit
+	http.HandleFunc("/large", func(w http.ResponseWriter, r *http.Request) {
+		sizeStr := r.FormValue("size")
+		size := 32768 // default 32KB
+		if sizeStr != "" {
+			n, _ := strconv.Atoi(sizeStr)
+			if n > 0 && n <= 1048576 {
+				size = n
+			}
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("X-Body-Size", strconv.Itoa(size))
+		buf := make([]byte, size)
+		for i := range buf {
+			buf[i] = byte('A' + (i % 26))
+		}
+		w.Write(buf)
+	})
+
 	http.ListenAndServe(":8080", nil)
 }
 

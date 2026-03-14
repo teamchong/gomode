@@ -17,7 +17,10 @@ const (
 	zbStringHeader = 4
 )
 
-var respBuf [16384]byte
+// Response buffer — grows dynamically to fit any response size.
+// With leaking GC this converges: once the buffer fits the largest
+// response, no further allocations happen.
+var respBuf []byte
 
 // ---------------------------------------------------------------------------
 // Header — case-insensitive, same as net/http.Header
@@ -809,28 +812,35 @@ func parseHeaderString(s string) Header {
 }
 
 func writeZerobufResponse(status int32, contentType string, body string, headers string) uint32 {
+	// Calculate total size: 4 slots + 3 string payloads (each 4-byte aligned)
+	needed := 4*zbValueSlot +
+		(zbStringHeader + len(contentType) + 3) & ^3 +
+		(zbStringHeader + len(body) + 3) & ^3 +
+		(zbStringHeader + len(headers) + 3) & ^3
+	if len(respBuf) < needed {
+		respBuf = make([]byte, needed)
+	}
+
 	base := uintptr(unsafe.Pointer(&respBuf[0]))
 
 	*(*uint8)(unsafe.Pointer(base)) = zbTagI32
 	*(*int32)(unsafe.Pointer(base + 4)) = status
 
-	dataOffset := uintptr(64) // 4 slots * 16 bytes
+	dataOffset := uintptr(4 * zbValueSlot)
 
 	ctPtr := base + dataOffset
 	*(*uint32)(unsafe.Pointer(ctPtr)) = uint32(len(contentType))
 	copy(unsafe.Slice((*byte)(unsafe.Pointer(ctPtr+zbStringHeader)), len(contentType)), contentType)
 	*(*uint8)(unsafe.Pointer(base + zbValueSlot)) = zbTagString
 	*(*uint32)(unsafe.Pointer(base + zbValueSlot + 4)) = uint32(ctPtr)
-	dataOffset += zbStringHeader + uintptr(len(contentType))
-	dataOffset = (dataOffset + 3) &^ 3
+	dataOffset += (zbStringHeader + uintptr(len(contentType)) + 3) &^ 3
 
 	bodyPtr := base + dataOffset
 	*(*uint32)(unsafe.Pointer(bodyPtr)) = uint32(len(body))
 	copy(unsafe.Slice((*byte)(unsafe.Pointer(bodyPtr+zbStringHeader)), len(body)), body)
 	*(*uint8)(unsafe.Pointer(base + 2*zbValueSlot)) = zbTagString
 	*(*uint32)(unsafe.Pointer(base + 2*zbValueSlot + 4)) = uint32(bodyPtr)
-	dataOffset += zbStringHeader + uintptr(len(body))
-	dataOffset = (dataOffset + 3) &^ 3
+	dataOffset += (zbStringHeader + uintptr(len(body)) + 3) &^ 3
 
 	hdrsPtr := base + dataOffset
 	*(*uint32)(unsafe.Pointer(hdrsPtr)) = uint32(len(headers))
