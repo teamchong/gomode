@@ -47,6 +47,12 @@ var fetchMethod string
 var fetchPending bool
 var fetchResult *Response
 
+// errFetchPending is returned by doFetch in phase 1 of the two-phase protocol.
+// The handler sees this error and returns early without processing the response.
+// HandleRequest detects fetchPending and signals JS to do the real fetch.
+// On phase 2, doFetch returns the cached result with no error.
+var errFetchPending = &httpError{"gomode: fetch pending"}
+
 func doFetch(method, rawurl, body, contentType string) (*Response, error) {
 	// Replay phase: JS already did the fetch and injected the result
 	if fetchResult != nil {
@@ -55,15 +61,12 @@ func doFetch(method, rawurl, body, contentType string) (*Response, error) {
 		return r, nil
 	}
 
-	// First phase: store the URL and method for HandleRequest to read
+	// First phase: store the URL and method for HandleRequest to read.
+	// Return an error so the handler exits early via its err != nil check.
 	fetchURL = rawurl
 	fetchMethod = method
 	fetchPending = true
-
-	// Return a zero-status response. The handler will finish running,
-	// and HandleRequest will detect fetchPending and return status=-1
-	// with the fetch URL/method serialized for JS.
-	return &Response{StatusCode: 0}, nil
+	return nil, errFetchPending
 }
 
 func readFetchResponse(base uintptr) *Response {
