@@ -1,8 +1,11 @@
 /**
- * GoDO — Durable Object with fast path direct memory access.
+ * GoDO — Durable Object with persistent WASM instance.
  *
- * Same optimizations as worker.ts: direct DataView writes/reads,
- * no zerobuf schema objects, pre-encoded methods.
+ * Same request/response protocol as worker.ts: full zerobuf slots,
+ * multi-fetch two-phase, zero-copy response bytes.
+ *
+ * Key difference: WASM instance persists for the DO lifetime,
+ * so Go globals (maps, counters, state) survive across requests.
  */
 
 import goWasmModule from "./go.wasm";
@@ -11,6 +14,7 @@ const textDecoder = new TextDecoder();
 const textEncoder = new TextEncoder();
 
 const VALUE_SLOT = 16;
+const TAG_I32 = 2;
 const TAG_STRING = 4;
 const STRING_HEADER = 4;
 
@@ -24,7 +28,8 @@ const METHOD_BYTES: Record<string, Uint8Array> = {
   OPTIONS: new Uint8Array([79, 80, 84, 73, 79, 78, 83]),
 };
 
-// Scratch space allocated per DO instance after WASM init
+// 10 slots (method, path, body, headers, fetch-result, fetch-url, + 4 fan-out) + 8KB data
+const REQ_SCRATCH_SIZE = 10 * VALUE_SLOT + 8192;
 
 interface Env {
   [key: string]: unknown;
@@ -47,6 +52,76 @@ function writeStringSlot(
   mem.setUint8(slotOffset, TAG_STRING);
   mem.setUint32(slotOffset + 4, dataOffset, true);
   return (dataOffset + STRING_HEADER + bytes.byteLength + 3) & ~3;
+}
+
+function writeI32Slot(mem: DataView, slotOffset: number, value: number): void {
+  mem.setUint8(slotOffset, TAG_I32);
+  mem.setInt32(slotOffset + 4, value, true);
+}
+
+interface WasmResponse {
+  status: number;
+  contentType: string;
+  bodyBytes: Uint8Array;
+  rawHeaders: string;
+  headers: Headers;
+}
+
+function readRawResponse(exports: GoWasmExports, respPtr: number): WasmResponse {
+  const buf = exports.memory.buffer;
+  const mem = new DataView(buf);
+
+  const status = mem.getInt32(respPtr + 4, true);
+
+  const ctPtr = mem.getUint32(respPtr + VALUE_SLOT + 4, true);
+  const ctLen = mem.getUint32(ctPtr, true);
+  const contentType = textDecoder.decode(new Uint8Array(buf, ctPtr + STRING_HEADER, ctLen));
+
+  const bodyPtr = mem.getUint32(respPtr + 2 * VALUE_SLOT + 4, true);
+  const bodyLen = mem.getUint32(bodyPtr, true);
+  const bodyBytes = new Uint8Array(buf, bodyPtr + STRING_HEADER, bodyLen).slice();
+
+  let rawHeaders = "";
+  const respHeaders = new Headers();
+  respHeaders.set("content-type", contentType);
+  const hdrsTag = mem.getUint8(respPtr + 3 * VALUE_SLOT);
+  if (hdrsTag === TAG_STRING) {
+    const hdrsDataPtr = mem.getUint32(respPtr + 3 * VALUE_SLOT + 4, true);
+    const hdrsLen = mem.getUint32(hdrsDataPtr, true);
+    if (hdrsLen > 0) {
+      rawHeaders = textDecoder.decode(new Uint8Array(buf, hdrsDataPtr + STRING_HEADER, hdrsLen));
+      for (const line of rawHeaders.split("\n")) {
+        const colonIdx = line.indexOf(": ");
+        if (colonIdx > 0) {
+          const key = line.slice(0, colonIdx).toLowerCase();
+          const val = line.slice(colonIdx + 2);
+          if (key !== "content-type") {
+            respHeaders.append(key, val);
+          }
+        }
+      }
+    }
+  }
+
+  return { status, contentType, bodyBytes, rawHeaders, headers: respHeaders };
+}
+
+function writeFetchResponseToWasm(exports: GoWasmExports, resp: { status: number; contentType: string; body: string }): number {
+  const ctBytes = textEncoder.encode(resp.contentType);
+  const bodyBytes = textEncoder.encode(resp.body);
+  const totalSize = 3 * VALUE_SLOT + STRING_HEADER + ctBytes.length + 4 + STRING_HEADER + bodyBytes.length + 4;
+  const ptr = exports.malloc(totalSize);
+
+  const mem = new DataView(exports.memory.buffer);
+  const u8 = new Uint8Array(exports.memory.buffer);
+
+  writeI32Slot(mem, ptr, resp.status);
+
+  let dataOffset = ptr + 3 * VALUE_SLOT;
+  dataOffset = writeStringSlot(mem, u8, ptr + VALUE_SLOT, dataOffset, ctBytes);
+  writeStringSlot(mem, u8, ptr + 2 * VALUE_SLOT, dataOffset, bodyBytes);
+
+  return ptr;
 }
 
 export class GoDO implements DurableObject {
@@ -77,7 +152,7 @@ export class GoDO implements DurableObject {
       }
     }
 
-    this.reqScratch = this.wasmExports.malloc(256);
+    this.reqScratch = this.wasmExports.malloc(REQ_SCRATCH_SIZE);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -92,39 +167,95 @@ export class GoDO implements DurableObject {
     const url = request.url;
     const schemeEnd = url.indexOf("//");
     const pathStart = schemeEnd === -1 ? 0 : url.indexOf("/", schemeEnd + 2);
-    const queryStart = url.indexOf("?", pathStart === -1 ? 0 : pathStart);
-    const pathname = pathStart === -1 ? "/" :
-      queryStart === -1 ? url.slice(pathStart) : url.slice(pathStart, queryStart);
+    const pathAndQuery = pathStart === -1 ? "/" : url.slice(pathStart);
 
-    const memory = exports.memory;
-    const buf = memory.buffer;
+    // Read request body
+    let body: string | null = null;
+    if (request.method === "POST" || request.method === "PUT" || request.method === "PATCH") {
+      body = await request.text();
+    }
+
+    // Build zerobuf request
+    const reqPtr = this.buildRequest(exports, request.method, pathAndQuery, body, request.headers);
+
+    // Call WASM handler with multi-fetch loop
+    let respPtr = exports.handle_zerobuf(reqPtr);
+    let raw = readRawResponse(exports, respPtr);
+
+    while (raw.status === -1) {
+      const fetchUrl = textDecoder.decode(raw.bodyBytes).trim();
+      const fetchMethod = raw.contentType.trim() || "GET";
+      const callIndex = parseInt(raw.rawHeaders || "0", 10);
+
+      const fetchResp = await fetch(fetchUrl, { method: fetchMethod }).catch((err) =>
+        new Response(String(err), { status: 502, headers: { "content-type": "text/plain" } })
+      );
+      const fetchBody = await fetchResp.text();
+      const fetchCt = fetchResp.headers.get("content-type") || "";
+
+      const fetchResultPtr = writeFetchResponseToWasm(exports, {
+        status: fetchResp.status,
+        contentType: fetchCt,
+        body: fetchBody,
+      });
+
+      const reqPtr2 = this.buildRequest(exports, request.method, pathAndQuery, body, request.headers);
+      const mem = new DataView(exports.memory.buffer);
+
+      mem.setUint8(reqPtr2 + 4 * VALUE_SLOT, TAG_STRING);
+      mem.setUint32(reqPtr2 + 4 * VALUE_SLOT + 4, fetchResultPtr, true);
+      writeI32Slot(mem, reqPtr2 + 5 * VALUE_SLOT, callIndex);
+
+      respPtr = exports.handle_zerobuf(reqPtr2);
+      raw = readRawResponse(exports, respPtr);
+    }
+
+    const nullBodyStatus = raw.status === 101 || raw.status === 204 || raw.status === 205 || raw.status === 304;
+    return new Response(nullBodyStatus ? null : raw.bodyBytes, { status: raw.status, headers: raw.headers });
+  }
+
+  private buildRequest(
+    exports: GoWasmExports,
+    method: string, pathname: string,
+    body: string | null,
+    headers: Headers
+  ): number {
+    const buf = exports.memory.buffer;
     const mem = new DataView(buf);
     const u8 = new Uint8Array(buf);
 
-    let dataOffset = this.reqScratch + 2 * VALUE_SLOT;
+    const numSlots = 6;
+    let dataOffset = this.reqScratch + numSlots * VALUE_SLOT;
 
-    const methodBytes = METHOD_BYTES[request.method] || textEncoder.encode(request.method);
+    // Slot 0: method
+    const methodBytes = METHOD_BYTES[method] || textEncoder.encode(method);
     dataOffset = writeStringSlot(mem, u8, this.reqScratch, dataOffset, methodBytes);
 
+    // Slot 1: path+query
     const pathBytes = textEncoder.encode(pathname);
     dataOffset = writeStringSlot(mem, u8, this.reqScratch + VALUE_SLOT, dataOffset, pathBytes);
 
-    const respPtr = exports.handle_zerobuf(this.reqScratch);
+    // Slot 2: body
+    const bodyBytes = body ? textEncoder.encode(body) : new Uint8Array(0);
+    dataOffset = writeStringSlot(mem, u8, this.reqScratch + 2 * VALUE_SLOT, dataOffset, bodyBytes);
 
-    const status = mem.getInt32(respPtr + 4, true);
-
-    const ctPtr = mem.getUint32(respPtr + VALUE_SLOT + 4, true);
-    const ctLen = mem.getUint32(ctPtr, true);
-    const contentType = textDecoder.decode(new Uint8Array(buf, ctPtr + STRING_HEADER, ctLen));
-
-    const bodyPtr = mem.getUint32(respPtr + 2 * VALUE_SLOT + 4, true);
-    const bodyLen = mem.getUint32(bodyPtr, true);
-    const body = textDecoder.decode(new Uint8Array(buf, bodyPtr + STRING_HEADER, bodyLen));
-
-    return new Response(body, {
-      status,
-      headers: { "content-type": contentType },
+    // Slot 3: headers
+    let headerStr = "";
+    headers.forEach((value, key) => {
+      headerStr += key + ": " + value + "\n";
     });
+    const headerBytes = textEncoder.encode(headerStr);
+    dataOffset = writeStringSlot(mem, u8, this.reqScratch + 3 * VALUE_SLOT, dataOffset, headerBytes);
+
+    // Slot 4: fetch result (zeroed)
+    mem.setUint8(this.reqScratch + 4 * VALUE_SLOT, 0);
+    mem.setUint32(this.reqScratch + 4 * VALUE_SLOT + 4, 0, true);
+
+    // Slot 5: fetch call index (zeroed)
+    mem.setUint8(this.reqScratch + 5 * VALUE_SLOT, 0);
+    mem.setUint32(this.reqScratch + 5 * VALUE_SLOT + 4, 0, true);
+
+    return this.reqScratch;
   }
 
   private buildWasiImports(): Record<string, WebAssembly.ImportValue> {
@@ -139,7 +270,7 @@ export class GoDO implements DurableObject {
           const ptr = mem.getUint32(iovs + i * 8, true);
           const len = mem.getUint32(iovs + i * 8 + 4, true);
           if (fd === 2) {
-            console.log("[gomode:stderr]", textDecoder.decode(new Uint8Array(memory.buffer, ptr, len)));
+            console.log("[gomode:do:stderr]", textDecoder.decode(new Uint8Array(memory.buffer, ptr, len)));
           }
           written += len;
         }
