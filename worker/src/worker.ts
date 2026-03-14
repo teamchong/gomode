@@ -49,8 +49,8 @@ let wasmExports: GoWasmExports | null = null;
 let initPromise: Promise<void> | null = null;
 let reqScratch = 0;
 
-// Max request scratch: 9 slots (method, path, body, headers, + 5 fan-out results) + 8KB data
-const REQ_SCRATCH_SIZE = 9 * VALUE_SLOT + 8192;
+// Max request scratch: 10 slots (method, path, body, headers, fetch-result, fetch-url, + 4 fan-out) + 8KB data
+const REQ_SCRATCH_SIZE = 10 * VALUE_SLOT + 8192;
 
 // ============================================================================
 // Two-phase fetch — Go handler calls http.Get(), WASM returns status=-1
@@ -252,8 +252,8 @@ function buildRequest(
   const mem = new DataView(buf);
   const u8 = new Uint8Array(buf);
 
-  // Always reserve at least 5 slots: method, path, body, headers, fetch-result
-  const numSlots = Math.max(5, 4 + (fanout?.length ?? 0));
+  // Reserve at least 6 slots: method, path, body, headers, fetch-result, fetch-url
+  const numSlots = Math.max(6, 6 + (fanout?.length ?? 0));
   let dataOffset = reqScratch + numSlots * VALUE_SLOT;
 
   // Slot 0: method
@@ -278,14 +278,18 @@ function buildRequest(
   const headerBytes = textEncoder.encode(headerStr);
   dataOffset = writeStringSlot(mem, u8, reqScratch + 3 * VALUE_SLOT, dataOffset, headerBytes);
 
-  // Slot 4: fetch result (zero = no pending fetch, set by two-phase protocol)
+  // Slot 4: fetch result (zero = no pending fetch, set by multi-fetch protocol)
   mem.setUint8(reqScratch + 4 * VALUE_SLOT, 0);
   mem.setUint32(reqScratch + 4 * VALUE_SLOT + 4, 0, true);
 
-  // Slots 5+: fan-out results
+  // Slot 5: fetch URL (zero = no URL, set by multi-fetch protocol)
+  mem.setUint8(reqScratch + 5 * VALUE_SLOT, 0);
+  mem.setUint32(reqScratch + 5 * VALUE_SLOT + 4, 0, true);
+
+  // Slots 6+: fan-out results
   if (fanout) {
     for (let i = 0; i < fanout.length; i++) {
-      const slot = reqScratch + (5 + i) * VALUE_SLOT;
+      const slot = reqScratch + (6 + i) * VALUE_SLOT;
       const item = fanout[i];
       if (item.type === "string") {
         const bytes = textEncoder.encode(item.value as string);
@@ -305,10 +309,10 @@ function buildRequest(
 interface WasmResponse {
   status: number;
   contentType: string;
-  /** Body as string — only populated for two-phase fetch (status=-1) */
-  body: string;
   /** Body as bytes — zero-copy from WASM memory */
   bodyBytes: Uint8Array;
+  /** Raw headers string (unparsed) — used for call index in status=-1 responses */
+  rawHeaders: string;
   headers: Headers;
 }
 
@@ -328,6 +332,7 @@ function readRawResponse(exports: GoWasmExports, respPtr: number): WasmResponse 
   // Copy body bytes out of WASM memory (buffer may be detached on next WASM call)
   const bodyBytes = new Uint8Array(buf, bodyPtr + STRING_HEADER, bodyLen).slice();
 
+  let rawHeaders = "";
   const respHeaders = new Headers();
   respHeaders.set("content-type", contentType);
   const hdrsTag = mem.getUint8(respPtr + 3 * VALUE_SLOT);
@@ -335,8 +340,8 @@ function readRawResponse(exports: GoWasmExports, respPtr: number): WasmResponse 
     const hdrsDataPtr = mem.getUint32(respPtr + 3 * VALUE_SLOT + 4, true);
     const hdrsLen = mem.getUint32(hdrsDataPtr, true);
     if (hdrsLen > 0) {
-      const hdrsStr = textDecoder.decode(new Uint8Array(buf, hdrsDataPtr + STRING_HEADER, hdrsLen));
-      for (const line of hdrsStr.split("\n")) {
+      rawHeaders = textDecoder.decode(new Uint8Array(buf, hdrsDataPtr + STRING_HEADER, hdrsLen));
+      for (const line of rawHeaders.split("\n")) {
         const colonIdx = line.indexOf(": ");
         if (colonIdx > 0) {
           const key = line.slice(0, colonIdx).toLowerCase();
@@ -349,7 +354,7 @@ function readRawResponse(exports: GoWasmExports, respPtr: number): WasmResponse 
     }
   }
 
-  return { status, contentType, body: "", bodyBytes, headers: respHeaders };
+  return { status, contentType, bodyBytes, rawHeaders, headers: respHeaders };
 }
 
 /** Convert raw response to a Web API Response object. */
@@ -392,15 +397,19 @@ async function handleWithFanout(
   // Build request with fan-out results already in WASM memory
   const reqPtr = buildRequest(exports, request.method, pathname, body, request.headers, fanout);
 
-  // Phase 1: call WASM handler
+  // Call WASM handler — loop for multi-fetch (each http.Get() = one round-trip)
   let respPtr = exports.handle_zerobuf(reqPtr);
   let raw = readRawResponse(exports, respPtr);
 
-  // Two-phase fetch: status=-1 means the handler needs an outbound fetch.
-  // Body contains the fetch URL, content-type field contains the HTTP method.
-  if (raw.status === -1) {
+  // Multi-fetch loop: status=-1 means the handler needs an outbound fetch.
+  // Body = fetch URL, content-type = HTTP method.
+  // Headers field = pending call index (for caching by call order).
+  // Loop until all fetches are resolved and handler completes normally.
+  while (raw.status === -1) {
     const fetchUrl = textDecoder.decode(raw.bodyBytes).trim();
     const fetchMethod = raw.contentType.trim() || "GET";
+    // Read call index from raw headers field (status=-1 responses use it for the index)
+    const callIndex = parseInt(raw.rawHeaders || "0", 10);
 
     const fetchResp = await fetch(fetchUrl, { method: fetchMethod }).catch((err) =>
       new Response(String(err), { status: 502, headers: { "content-type": "text/plain" } })
@@ -408,18 +417,23 @@ async function handleWithFanout(
     const fetchBody = await fetchResp.text();
     const fetchCt = fetchResp.headers.get("content-type") || "";
 
-    // Write fetch result into WASM memory as zerobuf slots
+    // Write fetch result into WASM memory
     const fetchResultPtr = writeFetchResponseToWasm({
       status: fetchResp.status,
       contentType: fetchCt,
       body: fetchBody,
     });
 
-    // Phase 2: replay with fetch result pointer in slot 4
+    // Replay: slot 4 = fetch result, slot 5 = call index (i32)
     const reqPtr2 = buildRequest(exports, request.method, pathname, body, request.headers, fanout);
     const mem = new DataView(exports.memory.buffer);
+
+    // Slot 4: fetch result pointer
     mem.setUint8(reqPtr2 + 4 * VALUE_SLOT, TAG_STRING);
     mem.setUint32(reqPtr2 + 4 * VALUE_SLOT + 4, fetchResultPtr, true);
+
+    // Slot 5: call index (i32) — Go uses this to cache result by call order
+    writeI32Slot(mem, reqPtr2 + 5 * VALUE_SLOT, callIndex);
 
     respPtr = exports.handle_zerobuf(reqPtr2);
     raw = readRawResponse(exports, respPtr);

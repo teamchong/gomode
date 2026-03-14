@@ -319,6 +319,38 @@ func main() {
 		})
 	})
 
+	// Multi-fetch — calls http.Get() twice in one handler
+	http.HandleFunc("/multi-fetch", func(w http.ResponseWriter, r *http.Request) {
+		url1 := r.FormValue("url1")
+		url2 := r.FormValue("url2")
+		if url1 == "" {
+			url1 = "https://httpbin.org/get"
+		}
+		if url2 == "" {
+			url2 = "https://example.com"
+		}
+
+		resp1, err := http.Get(url1)
+		if err != nil {
+			http.Error(w, "fetch1 failed: "+err.Error(), 502)
+			return
+		}
+
+		resp2, err := http.Get(url2)
+		if err != nil {
+			http.Error(w, "fetch2 failed: "+err.Error(), 502)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"fetch1_status": resp1.StatusCode,
+			"fetch1_length": resp1.ContentLength,
+			"fetch2_status": resp2.StatusCode,
+			"fetch2_length": resp2.ContentLength,
+		})
+	})
+
 	// Large response — proves dynamic buffer works beyond old 16KB limit
 	http.HandleFunc("/large", func(w http.ResponseWriter, r *http.Request) {
 		sizeStr := r.FormValue("size")

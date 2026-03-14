@@ -512,9 +512,9 @@ func (r *Request) ProtoAtLeast(major, minor int) bool {
 }
 
 // FanoutString reads a fan-out result from the request.
-// Index 0 = first fan-out result (JS slot 5). GoMode extension.
+// Index 0 = first fan-out result (JS slot 6). GoMode extension.
 func (r *Request) FanoutString(index int) string {
-	return readZBString(uintptr(r.reqBase) + uintptr((5+index)*zbValueSlot))
+	return readZBString(uintptr(r.reqBase) + uintptr((6+index)*zbValueSlot))
 }
 
 // ---------------------------------------------------------------------------
@@ -853,16 +853,13 @@ func writeZerobufResponse(status int32, contentType string, body string, headers
 
 // HandleRequest is called by the WASM export. Routes through mux or custom handler.
 //
-// Two-phase fetch protocol:
-//   Phase 1: Handler runs. If it calls http.Get(), doFetch sets fetchPending=true
-//   and the handler finishes with a dummy response. HandleRequest detects this
-//   and returns status=-1 with the fetch URL/method serialized in the body.
-//   JS reads the fetch params, does the actual fetch, writes the result as
-//   zerobuf slots at fan-out slot 4, and re-calls handle_zerobuf.
+// Multi-fetch two-phase protocol:
+//   Each http.Get() call in the handler triggers one round-trip to JS.
+//   Results are cached by URL. On each replay, previously-fetched URLs
+//   return immediately. The handler replays N+1 times for N distinct fetches.
 //
-//   Phase 2 (replay): HandleRequest reads the fetch result from slot 4,
-//   sets fetchResult, and re-runs the handler. doFetch returns the cached
-//   result. The handler completes normally.
+//   Slot 4 carries the fetch result from the previous round-trip.
+//   Slot 5 carries the URL that was fetched (so Go can cache it by URL).
 func HandleRequest(reqBase uint32) uint32 {
 	reqAddr := uintptr(reqBase)
 
@@ -876,13 +873,13 @@ func HandleRequest(reqBase uint32) uint32 {
 	}
 	hdrs := parseHeaderString(readZBString(reqAddr + 3*zbValueSlot))
 
-	// Check if this is a phase-2 replay with fetch result in slot 4
+	// Check if this is a replay with fetch result in slot 4 + call index in slot 5
 	fetchSlotAddr := reqAddr + 4*zbValueSlot
 	fetchSlotTag := *(*uint8)(unsafe.Pointer(fetchSlotAddr))
 	if fetchSlotTag == zbTagString {
-		// Slot 4 contains the fetch result as zerobuf sub-slots
 		fetchResultPtr := uintptr(*(*uint32)(unsafe.Pointer(fetchSlotAddr + 4)))
-		fetchResult = readFetchResponse(fetchResultPtr)
+		callIdx := int(*(*int32)(unsafe.Pointer(reqAddr + 5*zbValueSlot + 4)))
+		storeFetchResult(callIdx, readFetchResponse(fetchResultPtr))
 	}
 
 	req := &Request{
@@ -907,6 +904,7 @@ func HandleRequest(reqBase uint32) uint32 {
 	req.RequestURI = req.URL.RequestURI()
 
 	fetchPending = false
+	fetchCallIndex = 0
 
 	w := &responseWriter{
 		headers:    Header{},
@@ -919,13 +917,15 @@ func HandleRequest(reqBase uint32) uint32 {
 		defaultServeMux.ServeHTTP(w, req)
 	}
 
-	// If the handler triggered a fetch, return a special response
-	// so JS knows to do the fetch and replay.
+	// If the handler triggered a fetch, return status=-1 so JS does the fetch and replays.
+	// Headers field carries the pending call index for the round-trip.
 	if fetchPending {
 		fetchPending = false
-		// Return status=-1 with fetch URL in body and method in content-type
-		return writeZerobufResponse(-1, fetchMethod, fetchURL, "")
+		return writeZerobufResponse(-1, fetchMethod, fetchURL, itoa(fetchPendingIndex))
 	}
+
+	// All fetches resolved — clear cache for next request
+	fetchResults = nil
 
 	ct := w.headers.Get("Content-Type")
 	if ct == "" {

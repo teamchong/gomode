@@ -27,46 +27,50 @@ type Client struct {
 
 var DefaultClient = &Client{}
 
-// Two-phase fetch protocol (no Asyncify needed):
+// Multi-fetch two-phase protocol (no Asyncify needed):
 //
-// Phase 1: Go handler calls http.Get() → doFetch stores the outbound URL and
-// method in fetchURL/fetchMethod and sets fetchPending=true. The handler runs
-// to completion with a zero-status Response. HandleRequest detects fetchPending
-// and returns status=-1 to JS with the fetch URL in the body.
+// Supports multiple http.Get() calls in a single handler. Each call triggers
+// one round-trip: handler exits early, JS does the fetch, replays.
+// Results are cached by call index (not URL) so even duplicate URLs work correctly.
 //
-// JS reads the fetch params from the response, performs the actual fetch(),
-// writes the result into WASM memory as zerobuf slots, then re-calls
-// handle_zerobuf with the fetch result pointer in slot 4.
-//
-// Phase 2 (replay): HandleRequest reads the fetch result from slot 4,
-// sets fetchResult, and re-runs the handler. doFetch returns the cached
-// result. The handler completes normally.
+// Each replay resolves one more fetch. N fetches = N+1 WASM invocations.
+// The handler replays from the start each time — resolved calls return
+// instantly from cache, advancing to the next unresolved call.
 
 var fetchURL string
 var fetchMethod string
 var fetchPending bool
-var fetchResult *Response
+var fetchCallIndex int
+var fetchPendingIndex int
+var fetchResults map[int]*Response
 
-// errFetchPending is returned by doFetch in phase 1 of the two-phase protocol.
-// The handler sees this error and returns early without processing the response.
-// HandleRequest detects fetchPending and signals JS to do the real fetch.
-// On phase 2, doFetch returns the cached result with no error.
+// errFetchPending is returned by doFetch when a call hasn't been resolved yet.
 var errFetchPending = &httpError{"gomode: fetch pending"}
 
 func doFetch(method, rawurl, body, contentType string) (*Response, error) {
-	// Replay phase: JS already did the fetch and injected the result
-	if fetchResult != nil {
-		r := fetchResult
-		fetchResult = nil
-		return r, nil
+	idx := fetchCallIndex
+	fetchCallIndex++
+
+	// Check cache by call index
+	if fetchResults != nil {
+		if r, ok := fetchResults[idx]; ok {
+			return r, nil
+		}
 	}
 
-	// First phase: store the URL and method for HandleRequest to read.
-	// Return an error so the handler exits early via its err != nil check.
+	// Not resolved: store params for HandleRequest and exit early
+	fetchPendingIndex = idx
 	fetchURL = rawurl
 	fetchMethod = method
 	fetchPending = true
 	return nil, errFetchPending
+}
+
+func storeFetchResult(idx int, resp *Response) {
+	if fetchResults == nil {
+		fetchResults = map[int]*Response{}
+	}
+	fetchResults[idx] = resp
 }
 
 func readFetchResponse(base uintptr) *Response {
