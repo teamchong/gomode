@@ -43,7 +43,6 @@ jobs:
 
       - name: Start dev server and run tests
         run: |
-          cd worker && npx wrangler dev --port 8787 &
+          (cd worker && npx wrangler dev --port 8787) &
           sleep 5
-          cd ..
           npm test
