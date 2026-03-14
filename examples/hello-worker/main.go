@@ -47,12 +47,6 @@ var respBase uintptr
 // String storage — keep references alive for GC
 var respStrings [][]byte
 
-//export gomode_malloc
-func gomodeMalloc(size uint32) uint32 {
-	buf := make([]byte, size)
-	return uint32(uintptr(unsafe.Pointer(&buf[0])))
-}
-
 // readZBString reads a zerobuf string from a tagged value slot.
 // The slot has tag=4 at offset+0, string header ptr at offset+4.
 func readZBString(slotAddr uintptr) string {
@@ -115,103 +109,6 @@ func handleZerobuf(reqBase uint32) uint32 {
 	}
 
 	return uint32(respBase)
-}
-
-// ============================================================================
-// JSON path (kept for comparison benchmarks)
-// ============================================================================
-
-var respBuf []byte
-
-//export handle
-func handle(reqPtr, reqLen uint32) uint32 {
-	reqBytes := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(reqPtr))), int(reqLen))
-
-	// Minimal JSON parsing — find method and path without encoding/json
-	method, path := parseRequestJSON(reqBytes)
-
-	var status int
-	var contentType, body string
-
-	switch path {
-	case "/":
-		status = 200
-		contentType = "text/plain"
-		body = "Hello from GoMode!"
-	case "/json":
-		status = 200
-		contentType = "application/json"
-		body = `{"message":"Hello from GoMode!","method":"` + method + `","path":"` + path + `"}`
-	default:
-		status = 404
-		contentType = "text/plain"
-		body = "not found: " + path
-	}
-
-	respBuf = []byte(`{"status":` + itoa(status) + `,"headers":{"content-type":"` + contentType + `"},"body":"` + body + `"}`)
-	return uint32(len(respBuf))
-}
-
-//export getResponsePtr
-func getResponsePtr() uint32 {
-	if len(respBuf) == 0 {
-		return 0
-	}
-	return uint32(uintptr(unsafe.Pointer(&respBuf[0])))
-}
-
-// parseRequestJSON extracts method and path from JSON without encoding/json.
-func parseRequestJSON(data []byte) (method, path string) {
-	method = jsonStringValue(data, `"method":"`)
-	path = jsonStringValue(data, `"path":"`)
-	return
-}
-
-func jsonStringValue(data []byte, key string) string {
-	s := string(data)
-	idx := indexOf(s, key)
-	if idx < 0 {
-		return ""
-	}
-	start := idx + len(key)
-	end := start
-	for end < len(s) && s[end] != '"' {
-		end++
-	}
-	return s[start:end]
-}
-
-func indexOf(s, substr string) int {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return i
-		}
-	}
-	return -1
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	buf := make([]byte, 0, 10)
-	neg := false
-	if n < 0 {
-		neg = true
-		n = -n
-	}
-	for n > 0 {
-		buf = append(buf, byte('0'+n%10))
-		n /= 10
-	}
-	if neg {
-		buf = append(buf, '-')
-	}
-	// reverse
-	for i, j := 0, len(buf)-1; i < j; i, j = i+1, j-1 {
-		buf[i], buf[j] = buf[j], buf[i]
-	}
-	return string(buf)
 }
 
 func main() {}

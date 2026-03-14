@@ -11,7 +11,6 @@ export { GoDO } from "./go-do";
 import goWasmModule from "./go.wasm";
 import { Arena, defineSchema } from "zerobuf";
 
-const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
 interface Env {
@@ -21,10 +20,7 @@ interface Env {
 interface GoWasmExports {
   memory: WebAssembly.Memory;
   _start: () => void;
-  gomode_malloc: (size: number) => number;
-  handle: (reqPtr: number, reqLen: number) => number;
   handle_zerobuf: (reqBase: number) => number;
-  getResponsePtr: () => number;
 }
 
 // Zerobuf schemas — compiled once, reused across requests
@@ -156,54 +152,7 @@ async function ensureWasm(): Promise<GoWasmExports> {
   return wasmExports!;
 }
 
-async function handleDirect(request: Request): Promise<Response> {
-  const exports = await ensureWasm();
-  const url = new URL(request.url);
-  const headers: Record<string, string> = {};
-  request.headers.forEach((v, k) => { headers[k] = v; });
-
-  const reqJson = JSON.stringify({
-    method: request.method,
-    url: request.url,
-    path: url.pathname,
-    headers,
-  });
-
-  const reqBytes = textEncoder.encode(reqJson);
-  const reqPtr = exports.gomode_malloc(reqBytes.length);
-  new Uint8Array(exports.memory.buffer, reqPtr, reqBytes.length).set(reqBytes);
-
-  const respLen = exports.handle(reqPtr, reqBytes.length);
-  const respPtr = exports.getResponsePtr();
-  const respText = textDecoder.decode(new Uint8Array(exports.memory.buffer, respPtr, respLen));
-
-  try {
-    const resp = JSON.parse(respText) as {
-      status: number;
-      headers?: Record<string, string>;
-      body?: number[] | string;
-    };
-    const respHeaders = new Headers(resp.headers || {});
-    let respBody: BodyInit;
-    if (Array.isArray(resp.body)) {
-      respBody = new Uint8Array(resp.body);
-    } else {
-      respBody = resp.body || "";
-    }
-    return new Response(respBody, { status: resp.status || 200, headers: respHeaders });
-  } catch {
-    return new Response(respText, { status: 200, headers: { "content-type": "text/plain" } });
-  }
-}
-
-/**
- * Zero-copy path via zerobuf — no JSON serialization anywhere.
- *
- * JS writes request fields as tagged values directly into WASM memory.
- * Go reads at fixed offsets, writes response at fixed offsets.
- * JS reads response fields directly — no parse, no copy.
- */
-async function handleDirectZB(request: Request, pathname: string): Promise<Response> {
+async function handleRequest(request: Request, pathname: string): Promise<Response> {
   const exports = await ensureWasm();
 
   // Initialize arena over WASM memory (start at 1MB to avoid TinyGo heap)
@@ -254,7 +203,6 @@ export default {
       return durable.fetch(new Request(innerUrl.toString(), request));
     }
 
-    // Everything else → zerobuf zero-copy (default)
-    return handleDirectZB(request, url.pathname);
+    return handleRequest(request, url.pathname);
   },
 };
