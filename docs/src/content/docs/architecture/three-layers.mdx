@@ -3,16 +3,21 @@ title: Three Layers
 description: How GoMode's three layers work together.
 ---
 
+import { Image } from 'astro:assets';
+import architectureDiagram from '../../../assets/architecture.svg';
+
 ## Overview
 
 GoMode has three layers. Each can be understood independently.
 
+<Image src={architectureDiagram} alt="GoMode Architecture — three layers: JS Worker, zero-copy data exchange via zerobuf, and WASM (Go + Zig ABI)" />
+
 ```
 CF Request → Worker (JS)
-  → instantiates go.wasm (TinyGo + Zig ABI)
-  → calls handle(reqPtr, reqLen)
-  → Go processes request, uses Zig ABI for zero-copy ops
-  → reads response from WASM memory
+  → writes request as zerobuf tagged values into WASM memory
+  → calls handle_zerobuf(reqPtr)
+  → Go reads request at fixed offsets, processes, writes response at fixed offsets
+  → JS reads response directly from WASM memory
   → CF Response
 ```
 
@@ -28,14 +33,15 @@ JS writes data at 0x1A00 → Go/Zig reads it at 0x1A00
 Zero copy. Same memory, different languages reading it.
 ```
 
-### Columnar tables
+### SIMD batch operations
 
-Data laid out column-by-column in WASM memory (Arrow-like):
+Zig provides SIMD-accelerated operations for columnar data processing:
 
 ```
-ids:    [1, 2, 3, 4]           ← contiguous i32[] at ptr A
-names:  "AliceBobCharlie"      ← contiguous bytes at ptr B
-scores: [9.5, 8.2, 7.1, 9.9]  ← contiguous f64[] at ptr C
+zig_simd_sum_f64(ptr, count)       → sum of f64 array
+zig_simd_dot_f64(a, b, count)      → dot product
+zig_simd_scale_f64(ptr, count, s)  → multiply by scalar
+zig_simd_minmax_f64(ptr, count)    → min/max in one pass
 ```
 
 ### Host imports
@@ -44,30 +50,43 @@ scores: [9.5, 8.2, 7.1, 9.9]  ← contiguous f64[] at ptr C
 
 ## Layer 2: CF Worker (`worker/src/`)
 
-**`worker.ts`** — Entry point. Routes requests to direct WASM execution or a Durable Object.
+**`worker.ts`** — Entry point. Routes requests to direct WASM execution or a Durable Object. Uses zerobuf to write request fields and read response fields directly in WASM memory — no JSON serialization.
 
 **`go-do.ts`** — Durable Object. Instantiates WASM once, keeps it alive. Each request calls the exported `handle()` function.
 
-**`columnar-proxy.ts`** — JS Proxy that reads columnar data from `wasm.memory` via DataView:
+### Zero-copy data exchange
+
+Request and response schemas are defined once and reused:
 
 ```typescript
-const row = table.row(2);
-row.id    // → DataView.getInt32(id_ptr + 2*4)
-row.name  // → TextDecoder on the byte range
-row.score // → DataView.getFloat64(score_ptr + 2*8)
+import { Arena, defineSchema } from "zerobuf";
+
+const RequestSchema = defineSchema(["method", "path"]);
+const ResponseSchema = defineSchema(["status", "contentType", "body"]);
+
+// Per request:
+const req = RequestSchema.create(arena, { method: "GET", path: "/json" });
+const respPtr = exports.handle_zerobuf(req.__zerobuf_ptr);
+const resp = ResponseSchema.toJS(arena, respPtr);
+// resp.status, resp.body — read directly from WASM memory
 ```
 
-## Layer 3: Go SDK (`go-sdk/`)
+## Layer 3: Go Handler (`examples/hello-worker/`)
 
-Go exports a `handle()` function that receives a pointer to request data in WASM memory and returns a pointer to response data.
+Go exports a `handle_zerobuf()` function that reads request fields from zerobuf tagged value slots and writes response fields at fixed offsets — no JSON anywhere.
 
 ```go
-//export handle
-func handle(reqPtr, reqLen uint32) uint32 {
-  // Read request from shared memory
-  // Process
-  // Write response to shared memory
-  // Return response length
+//export handle_zerobuf
+func handleZerobuf(reqBase uint32) uint32 {
+  method := readZBString(reqAddr + 0*16)  // field 0
+  path := readZBString(reqAddr + 1*16)    // field 1
+
+  // Write response: [status, contentType, body]
+  writeZBI32(respBase + 0*16, 200)
+  writeZBString(respBase + 1*16, "application/json")
+  writeZBString(respBase + 2*16, `{"message":"Hello"}`)
+
+  return uint32(respBase)
 }
 ```
 
@@ -77,6 +96,6 @@ Go calls Zig ABI functions via `//go:wasmimport`:
 //go:wasmimport gomode zig_alloc
 func zigAlloc(len uint32) uint32
 
-//go:wasmimport gomode zig_table_push_i32
-func zigTablePushI32(table uint32, colIdx uint32, value int32) int32
+//go:wasmimport gomode zig_simd_sum_f64
+func zigSimdSumF64(ptr uint32, count uint32) float64
 ```
