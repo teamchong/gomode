@@ -30,4 +30,28 @@ describe("hello-worker", () => {
     const text = await resp.text();
     expect(text).toContain("not found");
   });
+
+  it("returns SHA-256 hash on GET /sha256", async () => {
+    const resp = await fetch("http://localhost:8787/sha256?input=hello");
+    expect(resp.status).toBe(200);
+    const data = await resp.json();
+    expect(data.input).toBe("hello");
+    expect(data.sha256).toBe("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+  });
+
+  it("returns uppercase on GET /upper", async () => {
+    const resp = await fetch("http://localhost:8787/upper?text=hello+gomode");
+    expect(resp.status).toBe(200);
+    const text = await resp.text();
+    expect(text).toBe("HELLO GOMODE");
+  });
+
+  it("returns SIMD results on GET /simd", async () => {
+    const resp = await fetch("http://localhost:8787/simd");
+    expect(resp.status).toBe(200);
+    const data = await resp.json();
+    expect(data.sum).toBe(36);
+    expect(data.dot).toBe(204);
+    expect(data.scaled_sum).toBe(72);
+  });
 });

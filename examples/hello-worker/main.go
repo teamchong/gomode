@@ -1,18 +1,48 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"gomode"
 	"net/http"
+	"strings"
 )
 
 func main() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Hello from GoMode!"))
+		fmt.Fprintf(w, "Hello from GoMode!")
 	})
 
 	http.HandleFunc("/json", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"message":"Hello from GoMode!","method":"` + r.Method + `","path":"` + r.URL.Path + `"}`))
+		json.NewEncoder(w).Encode(map[string]string{
+			"message": "Hello from GoMode!",
+			"method":  r.Method,
+			"path":    r.URL.Path,
+		})
+	})
+
+	http.HandleFunc("/sha256", func(w http.ResponseWriter, r *http.Request) {
+		input := r.FormValue("input")
+		if input == "" {
+			input = "hello"
+		}
+		hash := sha256.Sum256([]byte(input))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"input":  input,
+			"sha256": hex.EncodeToString(hash[:]),
+		})
+	})
+
+	http.HandleFunc("/upper", func(w http.ResponseWriter, r *http.Request) {
+		input := r.FormValue("text")
+		if input == "" {
+			input = "hello gomode"
+		}
+		fmt.Fprintf(w, strings.ToUpper(input))
 	})
 
 	http.HandleFunc("/simd", func(w http.ResponseWriter, r *http.Request) {
@@ -27,12 +57,13 @@ func main() {
 		min, max := gomode.MinMaxF64(data)
 
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(
-			`{"sum":` + gomode.FormatFloat(sum) +
-				`,"dot":` + gomode.FormatFloat(dot) +
-				`,"scaled_sum":` + gomode.FormatFloat(scaledSum) +
-				`,"min":` + gomode.FormatFloat(min) +
-				`,"max":` + gomode.FormatFloat(max) + `}`))
+		json.NewEncoder(w).Encode(map[string]float64{
+			"sum":        sum,
+			"dot":        dot,
+			"scaled_sum": scaledSum,
+			"min":        min,
+			"max":        max,
+		})
 	})
 
 	http.ListenAndServe(":8080", nil)
