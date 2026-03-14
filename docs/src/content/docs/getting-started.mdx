@@ -8,12 +8,13 @@ description: Set up GoMode and run your first Go handler on Cloudflare Workers.
 - **Go 1.22+** — `go version`
 - **TinyGo** — `brew install tinygo`
 - **Zig 0.15+** — [ziglang.org/download](https://ziglang.org/download/)
+- **wasm-ld** — comes with LLVM/Homebrew LLD
 - **Node.js 18+** — for wrangler
 
 ## Install
 
 ```bash
-git clone https://github.com/teamchong/gomode.git
+git clone https://github.com/user/gomode.git
 cd gomode
 npm install
 ```
@@ -21,14 +22,12 @@ npm install
 ## Build
 
 ```bash
-# Build TinyGo example to WASM
-npm run build:go
-
-# Build Zig ABI (when linked)
-npm run build:zig
-
-# Build both
+# Build Zig .o + TinyGo into single WASM binary
 npm run build
+
+# Or separately:
+npm run build:zig    # Zig → zig-abi.o
+npm run build:go     # TinyGo + zig-abi.o → go.wasm
 ```
 
 ## Run
@@ -38,78 +37,89 @@ npm run dev
 # → http://localhost:8787
 ```
 
-Two modes available:
+Routes:
 
-- `http://localhost:8787/` — Direct mode (stateless, max concurrency)
-- `http://localhost:8787/do/` — Durable Object mode (stateful, persistent WASM)
+- `http://localhost:8787/` — Hello world (Worker mode)
+- `http://localhost:8787/simd` — SIMD demo (Go calling Zig)
+- `http://localhost:8787/json` — JSON response
+- `http://localhost:8787/do/` — Durable Object mode
 
 ## Project structure
 
 ```
 worker/src/
-  worker.ts         — Entry point, routes to direct or DO
+  worker.ts         — Entry point, routes to Worker or DO
   go-do.ts          — Durable Object runtime
-  columnar-proxy.ts — Zero-copy Proxy for columnar data
 
 zig-abi/src/
-  main.zig          — Zig ABI exports
-  host.zig          — Host imports (sockets, random, KV)
-  columnar.zig      — Columnar format
+  main.zig          — Memory mgmt + SIMD exports
+  simd.zig          — WASM SIMD v128 batch operations
 
 go-sdk/
-  gomode.go         — Go SDK types and Zig FFI
+  gomode.go         — CGo wrappers for Zig functions
+  zig_abi.h         — C header for Zig exports
 
 examples/
-  hello-worker/     — Example Go handler
+  hello-worker/     — Example Go handler with SIMD
 ```
 
 ## Your first handler
 
-Create a new directory with a `go.mod` and `main.go`:
+Create a new directory:
 
 ```bash
 mkdir my-handler && cd my-handler
 go mod init my-handler
 ```
 
+Add `go-sdk` dependency:
+
+```
+# go.mod
+require gomode v0.0.0
+replace gomode => ../go-sdk
+```
+
+Write your handler:
+
 ```go
 package main
 
 import (
-  "encoding/json"
-  "unsafe"
+	"gomode"
+	"unsafe"
 )
 
-var respBuf []byte
+const (
+	tagI32    = 2
+	tagString = 4
+	valueSlot = 16
+	stringHeader = 4
+	respSize = 3 * valueSlot
+)
 
-//export gomode_malloc
-func gomodeMalloc(size uint32) uint32 {
-  buf := make([]byte, size)
-  return uint32(uintptr(unsafe.Pointer(&buf[0])))
-}
+var respBase uintptr
+var respStrings [][]byte
 
-//export handle
-func handle(reqPtr, reqLen uint32) uint32 {
-  reqBytes := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(reqPtr))), int(reqLen))
+// zerobuf read/write helpers (see examples/hello-worker/main.go)
 
-  var req struct {
-    Method string `json:"method"`
-    Path   string `json:"path"`
-  }
-  json.Unmarshal(reqBytes, &req)
+//export handle_zerobuf
+func handleZerobuf(reqBase uint32) uint32 {
+	path := readZBString(uintptr(reqBase) + 1*valueSlot)
 
-  resp, _ := json.Marshal(map[string]interface{}{
-    "status":  200,
-    "headers": map[string]string{"content-type": "application/json"},
-    "body":    `{"hello": "from GoMode", "path": "` + req.Path + `"}`,
-  })
-  respBuf = resp
-  return uint32(len(respBuf))
-}
-
-//export getResponsePtr
-func getResponsePtr() uint32 {
-  return uint32(uintptr(unsafe.Pointer(&respBuf[0])))
+	switch path {
+	case "/":
+		return writeResponse(200, "text/plain", "Hello!")
+	case "/sum":
+		data := []float64{1, 2, 3, 4}
+		sum := gomode.ZigSimdSumF64(
+			uint32(uintptr(unsafe.Pointer(&data[0]))),
+			uint32(len(data)),
+		)
+		return writeResponse(200, "text/plain", formatFloat(sum))
+	default:
+		return writeResponse(404, "text/plain", "not found")
+	}
 }
 
 func main() {}
@@ -118,7 +128,10 @@ func main() {}
 Build and run:
 
 ```bash
-tinygo build -target wasip1 -o ../build/go.wasm -scheduler=none -gc=conservative .
-cp ../build/go.wasm ../worker/src/go.wasm
-cd .. && npm run dev
+cd /path/to/gomode
+npm run build:zig
+tinygo build -target wasip1 -scheduler=none -gc=leaking \
+  -ldflags="-extldflags='build/zig-abi.o'" \
+  -o worker/src/go.wasm /path/to/my-handler
+npm run dev
 ```

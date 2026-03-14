@@ -5,7 +5,7 @@ description: How to write Go request handlers for GoMode.
 
 ## Reactor model
 
-GoMode uses a **reactor model**: `main()` runs once to initialize the Go runtime, then `handle()` is called for each request. The WASM instance stays alive.
+GoMode uses a **reactor model**: `main()` runs once to initialize the Go runtime, then `handle_zerobuf()` is called for each request. The WASM instance stays alive.
 
 ```go
 func main() {
@@ -13,100 +13,100 @@ func main() {
   // This runs once when WASM is first loaded.
 }
 
-//export handle
-func handle(reqPtr, reqLen uint32) uint32 {
+//export handle_zerobuf
+func handleZerobuf(reqBase uint32) uint32 {
   // Called for every request.
-  // reqPtr points to request JSON in WASM memory.
+  // reqBase points to zerobuf tagged values in WASM memory.
 }
 ```
 
 ## Request format
 
-The Worker writes request JSON into WASM memory and passes the pointer. The request shape:
+The Worker writes request fields as zerobuf tagged value slots directly into WASM memory:
 
-```json
-{
-  "method": "GET",
-  "url": "https://example.com/api/users",
-  "path": "/api/users",
-  "headers": { "content-type": "application/json" }
-}
-```
+- Field 0: `method` (string) at `reqBase + 0*16`
+- Field 1: `path` (string) at `reqBase + 1*16`
 
-Read it with `unsafe.Slice`:
+Read with the zerobuf helpers:
 
 ```go
-reqBytes := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(reqPtr))), int(reqLen))
-
-var req struct {
-  Method  string            `json:"method"`
-  Path    string            `json:"path"`
-  Headers map[string]string `json:"headers"`
-}
-json.Unmarshal(reqBytes, &req)
+reqAddr := uintptr(reqBase)
+method := readZBString(reqAddr + 0*16)
+path := readZBString(reqAddr + 1*16)
 ```
 
 ## Response format
 
-Write response JSON to a global buffer and return its length. The Worker reads it via `getResponsePtr()`.
+Write response fields as zerobuf tagged values and return the pointer:
 
 ```go
-var respBuf []byte
+func writeResponse(status int32, contentType string, body string) uint32 {
+  resp := make([]byte, 3*16) // 3 fields × 16 bytes
+  respStrings = respStrings[:0]
+  respBase = uintptr(unsafe.Pointer(&resp[0]))
 
-//export handle
-func handle(reqPtr, reqLen uint32) uint32 {
-  // ... process request ...
+  writeZBI32(respBase+0*16, status)
+  writeZBString(respBase+1*16, contentType)
+  writeZBString(respBase+2*16, body)
 
-  respBuf, _ = json.Marshal(map[string]interface{}{
-    "status":  200,
-    "headers": map[string]string{"content-type": "text/plain"},
-    "body":    "Hello!",
-  })
-  return uint32(len(respBuf))
-}
-
-//export getResponsePtr
-func getResponsePtr() uint32 {
-  return uint32(uintptr(unsafe.Pointer(&respBuf[0])))
+  return uint32(respBase)
 }
 ```
 
-## Memory allocation
+Response fields:
+- Field 0: `status` (i32) at `respBase + 0*16`
+- Field 1: `contentType` (string) at `respBase + 1*16`
+- Field 2: `body` (string) at `respBase + 2*16`
 
-The Worker needs to allocate space in WASM memory for the request. Export a malloc function:
+## Calling Zig SIMD
+
+Import the `gomode` package and call Zig functions directly:
 
 ```go
-//export gomode_malloc
-func gomodeMalloc(size uint32) uint32 {
-  buf := make([]byte, size)
-  return uint32(uintptr(unsafe.Pointer(&buf[0])))
+import "gomode"
+
+func handleSimd() uint32 {
+  data := []float64{1, 2, 3, 4, 5, 6, 7, 8}
+  ptr := uint32(uintptr(unsafe.Pointer(&data[0])))
+  count := uint32(len(data))
+
+  sum := gomode.ZigSimdSumF64(ptr, count)
+  dot := gomode.ZigSimdDotF64(ptr, ptr, count)
+
+  gomode.ZigSimdScaleF64(ptr, count, 2.0)
+
+  return writeResponse(200, "text/plain", formatFloat(sum))
 }
 ```
+
+These compile to direct WASM `call` instructions — zero overhead.
 
 ## Routing
 
 Route by path in your handler:
 
 ```go
-switch req.Path {
+switch path {
 case "/":
-  // home
-case "/api/users":
-  // users endpoint
-case "/health":
-  // health check
+  return writeResponse(200, "text/plain", "Hello!")
+case "/simd":
+  return handleSimd()
+case "/json":
+  return writeResponse(200, "application/json", `{"ok":true}`)
 default:
-  // 404
+  return writeResponse(404, "text/plain", "not found")
 }
 ```
 
 ## GC considerations
 
+- **`-gc=leaking`** — Never frees memory. Smallest binary (79KB). Fine for short-lived or low-traffic handlers.
 - **`-gc=conservative`** — Actual garbage collection. Use for long-lived DO instances with many requests.
-- **`-gc=leaking`** — Never frees memory. Smallest binary, fine for short-lived or low-traffic handlers.
 
 Build with:
 
 ```bash
-tinygo build -target wasip1 -scheduler=none -gc=conservative -o go.wasm .
+tinygo build -target wasip1 -scheduler=none -gc=leaking \
+  -ldflags="-extldflags='build/zig-abi.o'" \
+  -o build/go.wasm .
 ```

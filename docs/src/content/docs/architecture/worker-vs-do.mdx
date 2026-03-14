@@ -7,53 +7,51 @@ description: When to use direct Worker mode vs Durable Object mode.
 
 GoMode supports both stateless Workers and stateful Durable Objects. The Go handler code is identical — only the routing differs.
 
-## Direct mode (Worker)
+## Worker mode
 
 Requests go straight to WASM in the Worker isolate. CF spins up isolates as needed — each caches its own WASM instance.
 
 ```
 Browser → CF Edge → Worker isolate
-  → cached WASM instance
-  → handle(reqPtr, reqLen)
+  → cached WASM instance (Go + Zig, single binary)
+  → handle_zerobuf(reqPtr)
   → Response
 ```
 
-- **Stateless** — no shared state between requests (unless external KV/R2)
+- **Stateless** — no shared state between requests
 - **Max concurrency** — CF scales isolates horizontally
-- **Cold start ~13ms** — compile WASM + init Go runtime, then cached
 - **Route**: `/*`
 
 ## Durable Object mode
 
-Requests route through a Durable Object. WASM instantiates once and stays alive for the DO's lifetime.
+Requests route through a Durable Object. WASM instantiates once and stays alive.
 
 ```
 Browser → CF Edge → Worker → DO.fetch()
   → persistent WASM instance (stays alive)
-  → handle(reqPtr, reqLen)
+  → handle_zerobuf(reqPtr)
   → Response
 ```
 
 - **Stateful** — in-memory state persists between requests
 - **Single instance** — one DO globally, requests serialized
-- **Zero cold start** after first request — WASM stays warm
 - **Route**: `/do/*`
 
 ## Comparison
 
-| | Direct (Worker) | Durable Object |
+| | Worker (`/*`) | Durable Object (`/do/*`) |
 |---|---|---|
 | State | None | In-memory + durable storage |
 | Concurrency | CF scales isolates | Single instance, serialized |
 | WASM lifetime | Cached per isolate, may evict | Alive for DO lifetime |
-| Use case | APIs, transforms, auth | Sessions, counters, websockets, rate limiting |
-| Cold start | ~13ms (then cached) | ~13ms (then persistent) |
+| Throughput | ~3,764 req/sec | ~1,586 req/sec |
+| Use case | APIs, transforms, auth | Sessions, counters, websockets |
 
 ## When to use which
 
-**Use Direct mode** for stateless request/response handlers — API endpoints, data transforms, authentication checks, anything that doesn't need shared state.
+**Use Worker mode** for stateless request/response handlers — API endpoints, data transforms, SIMD compute, anything that doesn't need shared state.
 
-**Use DO mode** when you need state that persists between requests — user sessions, real-time counters, websocket connections, rate limiters, collaborative editing.
+**Use DO mode** when you need state that persists between requests — user sessions, real-time counters, websocket connections, rate limiters.
 
 You can mix both in the same worker:
 
@@ -64,5 +62,5 @@ if (url.pathname.startsWith("/do/")) {
   return durable.fetch(request);
 }
 // Stateless → direct WASM
-return handleDirect(request);
+return handleRequest(request, url.pathname);
 ```

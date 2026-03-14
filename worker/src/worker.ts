@@ -3,8 +3,8 @@
  *   /do/*  → Durable Object (stateful, persistent WASM instance)
  *   /*     → Direct WASM execution (stateless, max concurrency)
  *
- * Direct mode runs WASM in the Worker isolate. CF spins up isolates
- * as needed — each handles requests concurrently without DO queue.
+ * Single WASM binary: TinyGo + Zig linked via wasm-ld.
+ * Go calls Zig SIMD directly — internal function calls, zero overhead.
  */
 
 export { GoDO } from "./go-do";
@@ -23,11 +23,9 @@ interface GoWasmExports {
   handle_zerobuf: (reqBase: number) => number;
 }
 
-// Zerobuf schemas — compiled once, reused across requests
 const RequestSchema = defineSchema<{ method: string; path: string }>(["method", "path"]);
 const ResponseSchema = defineSchema<{ status: number; contentType: string; body: string }>(["status", "contentType", "body"]);
 
-// Cache WASM instance at module level — reused across requests in same isolate
 let wasmExports: GoWasmExports | null = null;
 let initPromise: Promise<void> | null = null;
 let zbArena: Arena | null = null;
@@ -106,34 +104,13 @@ function buildWasiImports(
   };
 }
 
-function buildHostImports(
-  getMemory: () => WebAssembly.Memory
-): Record<string, WebAssembly.ImportValue> {
-  return {
-    host_net_connect: () => -1,
-    host_net_send: () => -1,
-    host_net_recv: () => -1,
-    host_net_close: () => {},
-    host_random_get: (ptr: number, len: number) => {
-      crypto.getRandomValues(new Uint8Array(getMemory().buffer, ptr, len));
-    },
-    host_time_now: () => Date.now(),
-    host_console_log: (ptr: number, len: number) => {
-      console.log("[gomode]", textDecoder.decode(new Uint8Array(getMemory().buffer, ptr, len)));
-    },
-    host_kv_get: () => -1,
-    host_kv_put: () => -1,
-  };
-}
-
 async function initWasm(): Promise<void> {
   const getMemory = () => wasmExports!.memory;
-  const imports: WebAssembly.Imports = {
-    wasi_snapshot_preview1: buildWasiImports(getMemory),
-    gomode_host: buildHostImports(getMemory),
-  };
 
-  const instance = await WebAssembly.instantiate(goWasmModule, imports);
+  const instance = await WebAssembly.instantiate(goWasmModule, {
+    wasi_snapshot_preview1: buildWasiImports(getMemory),
+  });
+
   wasmExports = instance.exports as unknown as GoWasmExports;
 
   try {
@@ -155,29 +132,21 @@ async function ensureWasm(): Promise<GoWasmExports> {
 async function handleRequest(request: Request, pathname: string): Promise<Response> {
   const exports = await ensureWasm();
 
-  // Initialize arena over WASM memory (start at 1MB to avoid TinyGo heap)
   if (!zbArena) {
     zbArena = new Arena(exports.memory, 1024 * 1024);
   }
 
-  // Save arena checkpoint for per-request cleanup
   const checkpoint = zbArena.save();
 
   try {
-    const innerPath = pathname;
-
-    // Write request as zerobuf schema directly into WASM memory
     const req = RequestSchema.create(zbArena, {
       method: request.method,
-      path: innerPath,
+      path: pathname,
     });
 
-    // Call Go handler — passes pointer to request tagged values,
-    // returns pointer to response tagged values
     const reqPtr = (req as unknown as { __zerobuf_ptr: number }).__zerobuf_ptr;
     const respPtr = exports.handle_zerobuf(reqPtr);
 
-    // Read response directly from WASM memory — zero copy
     const resp = ResponseSchema.toJS(zbArena, respPtr);
 
     return new Response(resp.body, {
@@ -185,7 +154,6 @@ async function handleRequest(request: Request, pathname: string): Promise<Respon
       headers: { "content-type": resp.contentType },
     });
   } finally {
-    // Restore arena — free all per-request allocations
     zbArena.restore(checkpoint);
   }
 }
@@ -194,7 +162,6 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // /do/* → Durable Object (stateful, JSON path)
     if (url.pathname.startsWith("/do/")) {
       const id = env.GO_DO.idFromName("singleton");
       const durable = env.GO_DO.get(id);

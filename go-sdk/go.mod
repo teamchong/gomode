@@ -1,3 +1,3 @@
-module github.com/user/gomode/go-sdk
+module gomode
 
 go 1.22

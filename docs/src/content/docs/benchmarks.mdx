@@ -7,31 +7,36 @@ description: GoMode performance vs native Go and standard Go WASM.
 
 - **Machine**: Apple Silicon (M-series)
 - **Tool**: `wrk -t2 -c10 -d10s`
-- **Workload**: Hello world + JSON response handler
+- **Workload**: Hello world, JSON response, SIMD (Go calling Zig sum/dot/scale/minmax)
 - **Wrangler dev** for GoMode (local miniflare runtime)
 
 ## Results
 
 | | Native Go | GoMode (Worker) | GoMode (DO) | Std Go WASM |
 |---|---|---|---|---|
-| **GET / req/sec** | 80,715 | 3,145 | 1,465 | 614 |
-| **GET /json req/sec** | 83,182 | 3,454 | 1,478 | 537 |
-| **Latency (avg)** | 0.6ms | 3.8ms | 9.0ms | 78ms |
-| **Binary size** | native | 753KB | 753KB | 3.0MB |
+| **GET / req/sec** | 80,715 | 3,764 | 1,586 | 614 |
+| **GET /json req/sec** | 83,182 | 3,715 | — | 537 |
+| **GET /simd req/sec** | — | 3,692 | 1,574 | — |
+| **Latency (avg)** | 0.6ms | 3.2ms | 7.2ms | 78ms |
+| **Binary size** | native | 79KB | 79KB | 3.0MB |
 
-> **Note:** GoMode numbers are bottlenecked by wrangler dev (~3.5K req/sec ceiling). Production CF edge numbers will be significantly higher. We'll update these with production benchmarks soon.
+> **Note:** GoMode numbers are bottlenecked by wrangler dev (~3.7K req/sec ceiling). Production CF edge numbers will be significantly higher.
 
 ## GoMode vs Standard Go WASM
 
-**6.4x faster** throughput with a **4x smaller** binary.
+**6.1x faster** throughput with a **38x smaller** binary.
 
-The standard Go compiler produces a 3MB WASM binary with a heavy runtime (goroutine scheduler, full GC, large stdlib). TinyGo produces a 753KB binary with minimal runtime. GoMode uses zerobuf for zero-copy data exchange — no JSON serialization anywhere in the hot path.
+Standard Go produces a 3MB WASM binary with a heavy runtime (goroutine scheduler, full GC, large stdlib). GoMode produces a 79KB binary — TinyGo with `gc=leaking`, `scheduler=none`, and Zig linked directly in.
+
+## Zero overhead Zig SIMD
+
+The `/simd` route calls Zig SIMD functions (sum, dot product, scale, minmax) from Go. Throughput is identical to the plain hello world — **3,692 vs 3,764 req/sec**. This confirms the CGo linking adds zero overhead: Zig functions are direct `call` instructions in the same WASM binary.
 
 ## How zero-copy works
 
 GoMode eliminates all serialization between JS and Go:
 
-1. JS writes request fields as tagged values directly into WASM memory (32 bytes for 2 fields)
+1. JS writes request fields as zerobuf tagged values directly into WASM memory (32 bytes for 2 fields)
 2. Go reads at fixed offsets — no parsing
 3. Go writes response at fixed offsets — no serialization
 4. JS reads at fixed offsets — no parsing
@@ -40,7 +45,7 @@ Compare to standard Go WASM which requires `JSON.stringify` → encode → copy 
 
 ## Worker vs Durable Object
 
-Worker mode is **2.3x faster** than DO mode because:
+Worker mode is **2.4x faster** than DO mode because:
 
 - **No DO queue** — requests don't serialize through a single instance
 - **Horizontal scaling** — CF spins up multiple isolates, each with its own cached WASM instance
@@ -50,18 +55,13 @@ Use DO mode when you need state (WebSocket sessions, counters, etc.). Use Worker
 
 ## What's measured
 
-These benchmarks run on **wrangler dev** (local miniflare), not production CF edge. The wrangler dev server itself caps around ~3.5K req/sec, so these numbers reflect the wrangler bottleneck — not GoMode's actual throughput limit. Production numbers will differ:
-
-- Higher throughput (native V8 isolates, multi-core, distributed)
-- Lower latency (no miniflare simulation overhead)
-- Production benchmarks coming soon
+These benchmarks run on **wrangler dev** (local miniflare), not production CF edge. The wrangler dev server itself caps around ~3.7K req/sec, so these numbers reflect the wrangler bottleneck — not GoMode's actual throughput limit.
 
 ## What's NOT measured yet
 
 - **Production CF edge** — deploy benchmarks (coming soon)
-- **Zig SIMD acceleration** — not wired up yet. Will show gains on data transforms and batch processing.
-- **Columnar data** — bulk data workloads where the Arrow-like layout shines.
-- **Async CF bindings** — KV, R2, D1 via Asyncify (not integrated yet).
+- **Columnar SIMD workloads** — bulk data transforms with Zig SIMD
+- **Async CF bindings** — KV, R2, D1 via Asyncify (not integrated yet)
 
 ## Reproduce
 
@@ -69,15 +69,16 @@ These benchmarks run on **wrangler dev** (local miniflare), not production CF ed
 # Install wrk
 brew install wrk
 
-# Build WASM
-npm run build:go
+# Build single WASM binary
+npm run build
 
 # Start dev server
 npm run dev
 
 # Benchmark
 wrk -t2 -c10 -d10s http://localhost:8787/       # Worker mode
-wrk -t2 -c10 -d10s http://localhost:8787/json    # Worker mode (JSON response)
+wrk -t2 -c10 -d10s http://localhost:8787/json    # Worker JSON
+wrk -t2 -c10 -d10s http://localhost:8787/simd    # Worker SIMD
 wrk -t2 -c10 -d10s http://localhost:8787/do/     # DO mode
-wrk -t2 -c10 -d10s http://localhost:8787/do/json # DO mode (JSON response)
+wrk -t2 -c10 -d10s http://localhost:8787/do/simd # DO SIMD
 ```

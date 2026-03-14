@@ -3,7 +3,7 @@ title: gomode
 description: Go on Cloudflare Workers — fast, small, complete.
 template: splash
 hero:
-  tagline: TinyGo + Zig ABI on Cloudflare Workers. Small binaries, complete stdlib, zero-copy data exchange.
+  tagline: TinyGo + Zig in a single WASM binary. 79KB, SIMD, zero-copy, zero overhead.
   actions:
     - text: Get Started
       link: /gomode/getting-started/
@@ -27,14 +27,14 @@ Standard Go gives you the full stdlib but a massive binary with a heavy runtime.
 
 ## GoMode's answer
 
-Use TinyGo for the small binary, use **Zig to fill every gap** — with SIMD, zero-copy memory, and no runtime overhead.
+Use TinyGo for the small binary, use **Zig to fill every gap** — linked into the same WASM binary via `wasm-ld`. Zero runtime overhead.
 
 ```
-TinyGo (small binary, fast compile)
-  + Zig ABI (SIMD, zero-copy, polyfills missing stdlib)
-  + CF Workers (300+ edge locations, Durable Objects for state)
-  = Go on the edge, fast
+Zig (SIMD, memory, crypto polyfills) ──→ zig-abi.o
+Go handler (TinyGo, CGo) ─────────────→ wasm-ld → go.wasm (79KB)
 ```
+
+Go calls Zig via CGo — compiles to direct WASM `call` instructions. Same linear memory, no imports, no JS proxy, no serialization.
 
 ## Quick start
 
@@ -42,35 +42,33 @@ TinyGo (small binary, fast compile)
 package main
 
 import (
-  "encoding/json"
+  "gomode"
   "unsafe"
 )
 
-var respBuf []byte
+//export handle_zerobuf
+func handleZerobuf(reqBase uint32) uint32 {
+  path := readZBString(uintptr(reqBase) + 1*16)
 
-//export handle
-func handle(reqPtr, reqLen uint32) uint32 {
-  reqBytes := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(reqPtr))), int(reqLen))
-  var req map[string]interface{}
-  json.Unmarshal(reqBytes, &req)
-
-  respBuf, _ = json.Marshal(map[string]interface{}{
-    "status": 200,
-    "headers": map[string]string{"content-type": "text/plain"},
-    "body": "Hello from GoMode!",
-  })
-  return uint32(len(respBuf))
-}
-
-//export getResponsePtr
-func getResponsePtr() uint32 {
-  return uint32(uintptr(unsafe.Pointer(&respBuf[0])))
+  switch path {
+  case "/":
+    return writeResponse(200, "text/plain", "Hello from GoMode!")
+  case "/simd":
+    data := []float64{1, 2, 3, 4, 5, 6, 7, 8}
+    sum := gomode.ZigSimdSumF64(
+      uint32(uintptr(unsafe.Pointer(&data[0]))),
+      uint32(len(data)),
+    )
+    return writeResponse(200, "text/plain", formatFloat(sum))
+  }
+  return writeResponse(404, "text/plain", "not found")
 }
 
 func main() {}
 ```
 
 ```bash
-npm run build:go && npm run dev
+npm run build && npm run dev
 # → http://localhost:8787
+# → http://localhost:8787/simd
 ```

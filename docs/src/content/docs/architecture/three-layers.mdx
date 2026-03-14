@@ -8,7 +8,7 @@ import architectureDiagram from '../../../assets/architecture.svg';
 
 ## Overview
 
-GoMode has three layers. Each can be understood independently.
+GoMode has three layers compiled into a single WASM binary.
 
 <Image src={architectureDiagram} alt="GoMode Architecture — three layers: JS Worker, zero-copy data exchange via zerobuf, and WASM (Go + Zig ABI)" />
 
@@ -16,43 +16,43 @@ GoMode has three layers. Each can be understood independently.
 CF Request → Worker (JS)
   → writes request as zerobuf tagged values into WASM memory
   → calls handle_zerobuf(reqPtr)
-  → Go reads request at fixed offsets, processes, writes response at fixed offsets
+  → Go reads request, calls Zig SIMD internally (direct call)
+  → Go writes response at fixed offsets
   → JS reads response directly from WASM memory
   → CF Response
 ```
 
 ## Layer 1: Zig ABI (`zig-abi/src/`)
 
-Zig compiles to `wasm32-wasi` and exports functions with C ABI. Both Go and JS can call them directly — no serialization, just pointer math on shared WASM linear memory.
-
-### Memory management
-
-```
-JS calls zig_alloc(100) → gets pointer 0x1A00 in wasm.memory
-JS writes data at 0x1A00 → Go/Zig reads it at 0x1A00
-Zero copy. Same memory, different languages reading it.
-```
+Zig compiles to a relocatable `.o` and gets linked into go.wasm via `wasm-ld`. Go calls Zig functions through CGo — direct `call` instructions, zero overhead.
 
 ### SIMD batch operations
 
-Zig provides SIMD-accelerated operations for columnar data processing:
+Compiled with `-mcpu=generic+simd128` for WASM SIMD v128 instructions:
 
 ```
 zig_simd_sum_f64(ptr, count)       → sum of f64 array
 zig_simd_dot_f64(a, b, count)      → dot product
 zig_simd_scale_f64(ptr, count, s)  → multiply by scalar
-zig_simd_minmax_f64(ptr, count)    → min/max in one pass
+zig_simd_minmax_f64(ptr, count, o) → min/max in one pass
+zig_simd_add_f64(dst, a, b, count) → element-wise addition
 ```
 
-### Host imports
+### Memory management
 
-~10 functions in the `gomode_host` namespace: raw sockets, random bytes, time, console, KV. The JS worker implements these. All HTTP parsing, crypto, etc. stays inside WASM.
+```
+zig_alloc(len)         → allocate in WASM memory
+zig_free(ptr, len)     → free allocation
+zig_free_result(ptr)   → free length-prefixed result
+```
+
+Go passes raw pointers to Zig — same linear memory, zero copy.
 
 ## Layer 2: CF Worker (`worker/src/`)
 
-**`worker.ts`** — Entry point. Routes requests to direct WASM execution or a Durable Object. Uses zerobuf to write request fields and read response fields directly in WASM memory — no JSON serialization.
+**`worker.ts`** — Entry point. Routes requests to direct WASM or Durable Object. Uses zerobuf to write request fields and read response fields directly in WASM memory. Only provides 3 WASI imports (`fd_write`, `proc_exit`, `random_get`).
 
-**`go-do.ts`** — Durable Object. Instantiates WASM once, keeps it alive. Each request calls the exported `handle()` function.
+**`go-do.ts`** — Durable Object. Instantiates WASM once, keeps it alive.
 
 ### Zero-copy data exchange
 
@@ -65,37 +65,49 @@ const RequestSchema = defineSchema(["method", "path"]);
 const ResponseSchema = defineSchema(["status", "contentType", "body"]);
 
 // Per request:
-const req = RequestSchema.create(arena, { method: "GET", path: "/json" });
+const req = RequestSchema.create(arena, { method: "GET", path: "/simd" });
 const respPtr = exports.handle_zerobuf(req.__zerobuf_ptr);
 const resp = ResponseSchema.toJS(arena, respPtr);
 // resp.status, resp.body — read directly from WASM memory
 ```
 
-## Layer 3: Go Handler (`examples/hello-worker/`)
+## Layer 3: Go + Zig Handler (`examples/hello-worker/`)
 
-Go exports a `handle_zerobuf()` function that reads request fields from zerobuf tagged value slots and writes response fields at fixed offsets — no JSON anywhere.
+Go exports `handle_zerobuf()` which reads request fields from zerobuf tagged value slots, processes (optionally calling Zig SIMD), and writes response at fixed offsets.
 
 ```go
 //export handle_zerobuf
 func handleZerobuf(reqBase uint32) uint32 {
-  method := readZBString(reqAddr + 0*16)  // field 0
-  path := readZBString(reqAddr + 1*16)    // field 1
+  path := readZBString(uintptr(reqBase) + 1*16)
 
-  // Write response: [status, contentType, body]
-  writeZBI32(respBase + 0*16, 200)
-  writeZBString(respBase + 1*16, "application/json")
-  writeZBString(respBase + 2*16, `{"message":"Hello"}`)
-
-  return uint32(respBase)
+  switch path {
+  case "/simd":
+    data := []float64{1, 2, 3, 4, 5, 6, 7, 8}
+    sum := gomode.ZigSimdSumF64(
+      uint32(uintptr(unsafe.Pointer(&data[0]))),
+      uint32(len(data)),
+    )
+    return writeResponse(200, "text/plain", formatFloat(sum))
+  }
 }
 ```
 
-Go calls Zig ABI functions via `//go:wasmimport`:
+Go calls Zig via CGo — the C header declares Zig function signatures:
+
+```c
+// go-sdk/zig_abi.h
+double zig_simd_sum_f64(uint32_t ptr, uint32_t count);
+double zig_simd_dot_f64(uint32_t a, uint32_t b, uint32_t count);
+```
 
 ```go
-//go:wasmimport gomode zig_alloc
-func zigAlloc(len uint32) uint32
+// go-sdk/gomode.go
+/*
+#include "zig_abi.h"
+*/
+import "C"
 
-//go:wasmimport gomode zig_simd_sum_f64
-func zigSimdSumF64(ptr uint32, count uint32) float64
+func ZigSimdSumF64(ptr uint32, count uint32) float64 {
+  return float64(C.zig_simd_sum_f64(C.uint32_t(ptr), C.uint32_t(count)))
+}
 ```

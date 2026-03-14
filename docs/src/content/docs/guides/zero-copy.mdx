@@ -1,6 +1,6 @@
 ---
 title: Zero-Copy Data
-description: Eliminate serialization with zero-copy data exchange via WASM shared memory.
+description: How GoMode eliminates serialization with zerobuf and Zig SIMD.
 ---
 
 ## The problem
@@ -15,61 +15,59 @@ Go: json.Marshal(response)           ← serialize
 JS: JSON.parse(respText)             ← parse
 ```
 
-For a simple hello-world this doesn't matter. For 10K-row datasets, it's the bottleneck.
+## GoMode's zero-copy path
 
-## The zero-copy path
-
-With [zerobuf](https://github.com/teamchong/zerobuf) (planned integration):
+With [zerobuf](https://github.com/user/zerobuf):
 
 ```
 JS: write request fields to WASM memory (zerobuf layout)  ← direct write
-Go: read fields from WASM memory at known offsets          ← direct read
-Go: write response fields to WASM memory                   ← direct write
-JS: Proxy reads fields from WASM memory on access          ← direct read
+Go: read fields at fixed offsets                           ← direct read
+Go: write response fields at fixed offsets                 ← direct write
+JS: read response fields from WASM memory                 ← direct read
 ```
 
 No serialization. No parsing. Just pointer reads on shared memory.
 
-## Columnar tables (available now)
+## zerobuf tagged values
 
-For bulk data, GoMode uses an Arrow-like columnar layout via Zig:
+Each field is a 16-byte slot: `[tag:u8][pad:3][payloadA:u32][payloadB:f64]`
 
-```go
-// Go side — push values into columns
-//go:wasmimport gomode zig_table_create
-func zigTableCreate(nCols uint32) uint32
+Tags: `0=null, 1=bool, 2=i32, 3=f64, 4=string`
 
-//go:wasmimport gomode zig_table_push_i32
-func zigTablePushI32(table uint32, colIdx uint32, value int32) int32
-
-//go:wasmimport gomode zig_table_push_f64
-func zigTablePushF64(table uint32, colIdx uint32, value float64) int32
-```
-
-```typescript
-// JS side — read via Proxy, zero copy
-const row = table.row(0);
-row.id;    // DataView.getInt32(col_ptr + 0*4)
-row.score; // DataView.getFloat64(col_ptr + 0*8)
-row.name;  // TextDecoder on byte range
-```
-
-Data stays in `wasm.memory`. JS reads it directly via `DataView`. No JSON, no copies.
-
-## zerobuf integration (planned)
-
-[zerobuf](https://github.com/teamchong/zerobuf) provides a shared binary layout for JS and WASM. Both sides agree on the byte format (tagged values, strings, arrays, objects) and read/write the same memory.
-
-Go reads/writes zerobuf format using `unsafe.Pointer` at known byte offsets:
+Strings are stored as `[byteLen:u32][utf8 bytes...]` with a pointer in the payload.
 
 ```go
-// Read an f64 from a zerobuf tagged value slot
-// Layout: [tag:u8] [pad:3] [ptr:u32] [f64:8]
-val := *(*float64)(unsafe.Pointer(uintptr(ptr) + 8))
-
-// Read a zerobuf string: [len:u32] [utf8 bytes...]
-slen := *(*uint32)(unsafe.Pointer(uintptr(strPtr)))
-bytes := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(strPtr)+4)), int(slen))
+// Read a zerobuf string from a tagged value slot
+func readZBString(slotAddr uintptr) string {
+  headerPtr := uintptr(*(*uint32)(unsafe.Pointer(slotAddr + 4)))
+  byteLen := *(*uint32)(unsafe.Pointer(headerPtr))
+  bytes := unsafe.Slice((*byte)(unsafe.Pointer(headerPtr+4)), int(byteLen))
+  return string(bytes)
+}
 ```
 
-No Zig linking needed — Go just follows the same byte layout that JS and Zig already agree on.
+## SIMD on shared memory
+
+Go and Zig share the same WASM linear memory. Go allocates data, passes the pointer to Zig — no copy:
+
+```go
+data := []float64{1, 2, 3, 4, 5, 6, 7, 8}
+ptr := uint32(uintptr(unsafe.Pointer(&data[0])))
+
+// Zig reads from the same memory, runs SIMD v128 instructions
+sum := gomode.ZigSimdSumF64(ptr, uint32(len(data)))
+
+// Zig writes back to the same memory (in-place scale)
+gomode.ZigSimdScaleF64(ptr, uint32(len(data)), 2.0)
+```
+
+This is a direct function call within the same WASM binary — compiled to a single `call` instruction. No imports, no JS, no overhead.
+
+## Benchmarks confirm zero overhead
+
+| Route | req/sec | Description |
+|---|---|---|
+| `/` | 3,764 | Hello world (Go only) |
+| `/simd` | 3,692 | Go → Zig SIMD (sum, dot, scale, minmax) |
+
+Identical throughput. The Zig SIMD call path adds no measurable overhead.

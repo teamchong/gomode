@@ -1,8 +1,8 @@
 /**
- * GoDO — Durable Object that runs TinyGo WASM.
+ * GoDO — Durable Object that runs TinyGo + Zig WASM.
  *
- * WASM instance is created once and kept alive for the lifetime of the DO.
- * Each request calls handle_zerobuf() via zerobuf zero-copy — no JSON anywhere.
+ * Single WASM binary: TinyGo + Zig linked via wasm-ld.
+ * WASM instance created once and kept alive for the DO lifetime.
  */
 
 import goWasmModule from "./go.wasm";
@@ -36,12 +36,10 @@ export class GoDO implements DurableObject {
   }
 
   private async initWasm(): Promise<void> {
-    const imports: WebAssembly.Imports = {
+    const instance = await WebAssembly.instantiate(goWasmModule, {
       wasi_snapshot_preview1: this.buildWasiImports(),
-      gomode_host: this.buildHostImports(),
-    };
+    });
 
-    const instance = await WebAssembly.instantiate(goWasmModule, imports);
     this.wasmExports = instance.exports as unknown as GoWasmExports;
 
     try {
@@ -163,26 +161,6 @@ export class GoDO implements DurableObject {
         return 0;
       },
       sched_yield: () => 0,
-    };
-  }
-
-  private buildHostImports(): Record<string, WebAssembly.ImportValue> {
-    const getMemory = () => this.wasmExports!.memory;
-
-    return {
-      host_net_connect: () => -1,
-      host_net_send: () => -1,
-      host_net_recv: () => -1,
-      host_net_close: () => {},
-      host_random_get: (ptr: number, len: number) => {
-        crypto.getRandomValues(new Uint8Array(getMemory().buffer, ptr, len));
-      },
-      host_time_now: () => Date.now(),
-      host_console_log: (ptr: number, len: number) => {
-        console.log("[gomode]", textDecoder.decode(new Uint8Array(getMemory().buffer, ptr, len)));
-      },
-      host_kv_get: () => -1,
-      host_kv_put: () => -1,
     };
   }
 }

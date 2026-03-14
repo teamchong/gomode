@@ -1,12 +1,9 @@
 /**
- * Build the Zig ABI layer to wasm32-wasi.
- * Output: build/zig-abi.wasm
+ * Build Zig ABI to a relocatable .o for linking into go.wasm.
+ * Output: build/zig-abi.o
  *
- * This is the Zig component that provides:
- * - Memory management (zig_alloc, zig_free, zig_free_result)
- * - SIMD batch operations (zig_simd_*)
- * - HTTP fetch (zig_http_fetch)
- * - Host import forwarding
+ * TinyGo links this .o via -extldflags into a single WASM binary.
+ * Go calls Zig functions via CGo — direct wasm call instructions.
  */
 
 import { spawnSync } from "child_process";
@@ -21,21 +18,19 @@ const zigSrc = join(root, "zig-abi", "src");
 
 mkdirSync(buildDir, { recursive: true });
 
-console.log("[build-zig-abi] Compiling Zig ABI to wasm32-wasi...");
+console.log("[build-zig-abi] Compiling Zig to wasm32-wasi relocatable object...");
 
 const result = spawnSync(
   "zig",
   [
-    "build-exe",
+    "build-obj",
     join(zigSrc, "main.zig"),
     "-target",
     "wasm32-wasi",
     "-mcpu=generic+simd128",
     "-O",
     "ReleaseSmall",
-    "--name",
-    "zig-abi",
-    "-femit-bin=" + join(buildDir, "zig-abi.wasm"),
+    "-femit-bin=" + join(buildDir, "zig-abi.o"),
   ],
   { cwd: root, stdio: "inherit" }
 );
@@ -45,4 +40,4 @@ if (result.status !== 0) {
   process.exit(1);
 }
 
-console.log("[build-zig-abi] Output:", join(buildDir, "zig-abi.wasm"));
+console.log("[build-zig-abi] Output:", join(buildDir, "zig-abi.o"));

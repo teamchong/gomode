@@ -94,6 +94,7 @@ pub fn addF64(dst: []f64, a: []const f64, b: []const f64) void {
 }
 
 /// Find min and max of an f64 slice.
+/// Uses @select instead of @min/@max to avoid fmin/fmax libcall dependency.
 pub fn minmaxF64(data: []const f64) struct { min: f64, max: f64 } {
     if (data.len == 0) return .{ .min = 0, .max = 0 };
 
@@ -108,12 +109,18 @@ pub fn minmaxF64(data: []const f64) struct { min: f64, max: f64 } {
         const vecs: [*]const @Vector(VEC_F64_LEN, f64) = @alignCast(@ptrCast(data.ptr));
 
         for (0..chunks) |i| {
-            min_acc = @min(min_acc, vecs[i]);
-            max_acc = @max(max_acc, vecs[i]);
+            const v = vecs[i];
+            const lt = v < min_acc;
+            const gt = v > max_acc;
+            min_acc = @select(f64, lt, v, min_acc);
+            max_acc = @select(f64, gt, v, max_acc);
         }
 
-        min_val = @reduce(.Min, min_acc);
-        max_val = @reduce(.Max, max_acc);
+        // Reduce vectors to scalars
+        inline for (0..VEC_F64_LEN) |lane| {
+            if (min_acc[lane] < min_val) min_val = min_acc[lane];
+            if (max_acc[lane] > max_val) max_val = max_acc[lane];
+        }
 
         for (data[chunks * VEC_F64_LEN ..]) |v| {
             if (v < min_val) min_val = v;
