@@ -188,7 +188,18 @@ type URL struct {
 }
 
 func (u *URL) String() string {
-	s := u.Path
+	s := ""
+	if u.Scheme != "" {
+		s += u.Scheme + "://"
+	}
+	if u.Host != "" {
+		s += u.Host
+	}
+	if u.Path != "" {
+		s += u.Path
+	} else if u.Scheme != "" || u.Host != "" {
+		s += "/"
+	}
 	if u.RawQuery != "" {
 		s += "?" + u.RawQuery
 	}
@@ -196,6 +207,35 @@ func (u *URL) String() string {
 		s += "#" + u.Fragment
 	}
 	return s
+}
+
+func parseRawURL(rawurl string) *URL {
+	u := &URL{}
+	if i := strings.Index(rawurl, "://"); i >= 0 {
+		u.Scheme = rawurl[:i]
+		rawurl = rawurl[i+3:]
+		j := strings.IndexByte(rawurl, '/')
+		if j < 0 {
+			u.Host = rawurl
+			u.Path = "/"
+			return u
+		}
+		u.Host = rawurl[:j]
+		rawurl = rawurl[j:]
+	}
+	if i := strings.IndexByte(rawurl, '#'); i >= 0 {
+		u.Fragment = rawurl[i+1:]
+		rawurl = rawurl[:i]
+	}
+	if i := strings.IndexByte(rawurl, '?'); i >= 0 {
+		u.RawQuery = rawurl[i+1:]
+		rawurl = rawurl[:i]
+	}
+	u.Path = rawurl
+	if u.Path == "" {
+		u.Path = "/"
+	}
+	return u
 }
 
 func (u *URL) Query() map[string][]string {
@@ -751,9 +791,16 @@ func HandleRequest(reqBase uint32) uint32 {
 	reqAddr := uintptr(reqBase)
 
 	bodyStr := readZBString(reqAddr + 2*zbValueSlot)
+	rawPath := readZBString(reqAddr + 1*zbValueSlot)
+	urlPath := rawPath
+	rawQuery := ""
+	if qi := strings.IndexByte(rawPath, '?'); qi >= 0 {
+		urlPath = rawPath[:qi]
+		rawQuery = rawPath[qi+1:]
+	}
 	req := &Request{
 		Method:      readZBString(reqAddr + 0*zbValueSlot),
-		URL:         &URL{Path: readZBString(reqAddr + 1*zbValueSlot)},
+		URL:         &URL{Path: urlPath, RawQuery: rawQuery},
 		Proto:       "HTTP/1.1",
 		ProtoMajor:  1,
 		ProtoMinor:  1,

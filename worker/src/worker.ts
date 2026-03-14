@@ -43,6 +43,11 @@ interface GoWasmExports {
   _start: () => void;
   handle_zerobuf: (reqBase: number) => number;
   malloc: (size: number) => number;
+  asyncify_start_unwind: (dataAddr: number) => void;
+  asyncify_stop_unwind: () => void;
+  asyncify_start_rewind: (dataAddr: number) => void;
+  asyncify_stop_rewind: () => void;
+  asyncify_get_state: () => number;
 }
 
 let wasmExports: GoWasmExports | null = null;
@@ -51,6 +56,66 @@ let reqScratch = 0;
 
 // Max request scratch: 8 slots (method, path, body, + 5 fan-out results) + 4KB data
 const REQ_SCRATCH_SIZE = 8 * VALUE_SLOT + 4096;
+
+// ============================================================================
+// Asyncify runtime — enables Go code to call async JS functions (fetch, etc.)
+// ============================================================================
+
+const ASYNCIFY_DATA_SIZE = 16384; // 16KB stack save buffer
+let asyncifyDataAddr = 0;
+let asyncifyResuming = false;
+let pendingFetchPromise: Promise<{ status: number; contentType: string; body: string }> | null = null;
+let fetchResponsePtr = 0;
+
+function resetAsyncifyData(): void {
+  const mem = new DataView(wasmExports!.memory.buffer);
+  mem.setInt32(asyncifyDataAddr, asyncifyDataAddr + 8, true);
+  mem.setInt32(asyncifyDataAddr + 4, asyncifyDataAddr + ASYNCIFY_DATA_SIZE, true);
+}
+
+/** Write a fetch response into WASM memory as zerobuf slots for Go to read. */
+function writeFetchResponseToWasm(resp: { status: number; contentType: string; body: string }): number {
+  const ctBytes = textEncoder.encode(resp.contentType);
+  const bodyBytes = textEncoder.encode(resp.body);
+  const totalSize = 3 * VALUE_SLOT + STRING_HEADER + ctBytes.length + 4 + STRING_HEADER + bodyBytes.length + 4;
+  const ptr = wasmExports!.malloc(totalSize);
+
+  const mem = new DataView(wasmExports!.memory.buffer);
+  const u8 = new Uint8Array(wasmExports!.memory.buffer);
+
+  // Slot 0: status (i32)
+  writeI32Slot(mem, ptr, resp.status);
+
+  // Slot 1: content-type (string)
+  let dataOffset = ptr + 3 * VALUE_SLOT;
+  dataOffset = writeStringSlot(mem, u8, ptr + VALUE_SLOT, dataOffset, ctBytes);
+
+  // Slot 2: body (string)
+  writeStringSlot(mem, u8, ptr + 2 * VALUE_SLOT, dataOffset, bodyBytes);
+
+  return ptr;
+}
+
+/** Call handle_zerobuf with Asyncify suspend/resume support. */
+async function callWasmAsync(reqPtr: number): Promise<number> {
+  let result = wasmExports!.handle_zerobuf(reqPtr);
+
+  while (pendingFetchPromise) {
+    wasmExports!.asyncify_stop_unwind();
+
+    const fetchResult = await pendingFetchPromise;
+    pendingFetchPromise = null;
+
+    fetchResponsePtr = writeFetchResponseToWasm(fetchResult);
+
+    asyncifyResuming = true;
+    resetAsyncifyData();
+    wasmExports!.asyncify_start_rewind(asyncifyDataAddr);
+    result = wasmExports!.handle_zerobuf(reqPtr);
+  }
+
+  return result;
+}
 
 function buildWasiImports(
   getMemory: () => WebAssembly.Memory
@@ -131,6 +196,45 @@ async function initWasm(): Promise<void> {
 
   const instance = await WebAssembly.instantiate(goWasmModule, {
     wasi_snapshot_preview1: buildWasiImports(getMemory),
+    env: {
+      __gomode_fetch(
+        urlPtr: number, urlLen: number,
+        methodPtr: number, methodLen: number,
+        bodyPtr: number, bodyLen: number,
+        ctPtr: number, ctLen: number,
+      ): number {
+        if (asyncifyResuming) {
+          asyncifyResuming = false;
+          wasmExports!.asyncify_stop_rewind();
+          return fetchResponsePtr;
+        }
+
+        const buf = wasmExports!.memory.buffer;
+        const url = textDecoder.decode(new Uint8Array(buf, urlPtr, urlLen));
+        const method = textDecoder.decode(new Uint8Array(buf, methodPtr, methodLen));
+        const body = bodyLen > 0 ? textDecoder.decode(new Uint8Array(buf, bodyPtr, bodyLen)) : null;
+        const ct = ctLen > 0 ? textDecoder.decode(new Uint8Array(buf, ctPtr, ctLen)) : undefined;
+
+        const headers: Record<string, string> = {};
+        if (ct) headers["content-type"] = ct;
+
+        pendingFetchPromise = fetch(url, { method, body, headers })
+          .then(async (resp) => ({
+            status: resp.status,
+            contentType: resp.headers.get("content-type") || "",
+            body: await resp.text(),
+          }))
+          .catch((err) => ({
+            status: 0,
+            contentType: "text/plain",
+            body: String(err),
+          }));
+
+        resetAsyncifyData();
+        wasmExports!.asyncify_start_unwind(asyncifyDataAddr);
+        return 0;
+      },
+    },
   });
 
   wasmExports = instance.exports as unknown as GoWasmExports;
@@ -143,6 +247,10 @@ async function initWasm(): Promise<void> {
   }
 
   reqScratch = wasmExports.malloc(REQ_SCRATCH_SIZE);
+
+  // Allocate Asyncify data buffer for suspend/resume
+  asyncifyDataAddr = wasmExports.malloc(ASYNCIFY_DATA_SIZE);
+  resetAsyncifyData();
 }
 
 async function ensureWasm(): Promise<GoWasmExports> {
@@ -313,8 +421,8 @@ async function handleWithFanout(
   // Build request with fan-out results already in WASM memory
   const reqPtr = buildRequest(exports, request.method, pathname, body, fanout);
 
-  // Call WASM — pure compute, no async, no blocking
-  const respPtr = exports.handle_zerobuf(reqPtr);
+  // Call WASM with Asyncify support — suspends if Go calls http.Get() etc.
+  const respPtr = await callWasmAsync(reqPtr);
 
   return readResponse(exports, respPtr);
 }
@@ -359,6 +467,15 @@ function extractPathname(url: string): string {
   return queryStart === -1 ? url.slice(pathStart) : url.slice(pathStart, queryStart);
 }
 
+/** Extract path + query string (e.g., "/sha256?input=hello") for WASM. */
+function extractPathAndQuery(url: string): string {
+  const schemeEnd = url.indexOf("//");
+  if (schemeEnd === -1) return url;
+  const pathStart = url.indexOf("/", schemeEnd + 2);
+  if (pathStart === -1) return "/";
+  return url.slice(pathStart);
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const pathname = extractPathname(request.url);
@@ -372,6 +489,7 @@ export default {
     }
 
     const exports = await ensureWasm();
-    return handleWithFanout(exports, request, pathname, env);
+    const pathAndQuery = extractPathAndQuery(request.url);
+    return handleWithFanout(exports, request, pathAndQuery, env);
   },
 };

@@ -5,9 +5,9 @@
  * TinyGo compiles Go to wasm32-wasi. Zig .o is linked in via -extldflags.
  * Go calls Zig functions via CGo — direct internal calls, zero overhead.
  *
- * The build patches TinyGo's cached GOROOT to replace net/http with GoMode's
- * implementation. Users write standard Go with `import "net/http"` and
- * it compiles without changes.
+ * The build patches TinyGo's TINYGOROOT/src/net/http/ with GoMode's overlay,
+ * then restores it after build. This ensures `import "net/http"` compiles to
+ * GoMode's implementation. Users write standard Go — no code changes needed.
  *
  * Requires: build/zig-abi.o (run npm run build:zig first)
  *
@@ -17,7 +17,7 @@
  * If no path given, builds examples/hello-worker.
  */
 
-import { spawnSync, execSync } from "child_process";
+import { spawnSync } from "child_process";
 import { mkdirSync, existsSync, copyFileSync, cpSync, rmSync } from "fs";
 import { dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
@@ -46,34 +46,53 @@ if (!existsSync(userPath)) {
 }
 
 // ============================================================================
-// Patch TinyGo's cached GOROOT to replace net/http with GoMode's version.
-// TinyGo creates a cached GOROOT by merging Go stdlib with its own overrides.
-// We replace net/http in that cache with our implementation so users can
-// write `import "net/http"` and it just works.
+// Patch TinyGo's src/net/http with GoMode's overlay.
+//
+// TinyGo resolves packages from TINYGOROOT/src/ (its own overrides) before
+// the Go stdlib. We replace src/net/http/ with our implementation so users
+// write `import "net/http"` and it compiles to GoMode's zerobuf-backed version.
+//
+// The original files are backed up and restored after build.
 // ============================================================================
 
-console.log("[build-tinygo] Patching TinyGo cached GOROOT with GoMode net/http...");
+const tinygoRoot = spawnSync("tinygo", ["env", "TINYGOROOT"], {
+  encoding: "utf-8",
+}).stdout.trim();
 
-// Force TinyGo to create/update its cached GOROOT
-spawnSync("tinygo", ["info", "-target", "wasip1"], {
-  stdio: "ignore",
-});
+if (!tinygoRoot || !existsSync(tinygoRoot)) {
+  console.error("[build-tinygo] Could not find TINYGOROOT");
+  process.exit(1);
+}
 
-// Find the cached GOROOT
+const tinygoHttp = join(tinygoRoot, "src", "net", "http");
+const backupHttp = join(buildDir, "tinygo-http-backup");
+
+console.log("[build-tinygo] Patching TinyGo net/http with GoMode overlay...");
+
+// Backup original TinyGo net/http
+rmSync(backupHttp, { recursive: true, force: true });
+cpSync(tinygoHttp, backupHttp, { recursive: true });
+
+// Replace with our overlay
+rmSync(tinygoHttp, { recursive: true, force: true });
+cpSync(join(overlayDir, "net", "http"), tinygoHttp, { recursive: true });
+
+// Also patch the cached GOROOT (TinyGo merges sources there)
+spawnSync("tinygo", ["info", "-target", "wasip1"], { stdio: "ignore" });
 const infoResult = spawnSync("tinygo", ["info", "-target", "wasip1"], {
   encoding: "utf-8",
 });
 const gorootMatch = infoResult.stdout.match(/cached GOROOT:\s+(\S+)/);
-if (!gorootMatch) {
-  console.error("[build-tinygo] Could not find TinyGo cached GOROOT");
-  process.exit(1);
+if (gorootMatch) {
+  const cachedHttp = join(gorootMatch[1], "src", "net", "http");
+  rmSync(cachedHttp, { recursive: true, force: true });
+  cpSync(join(overlayDir, "net", "http"), cachedHttp, { recursive: true });
 }
-const cachedGoroot = gorootMatch[1];
 
-// Replace net/http with our overlay
-const cachedHttp = join(cachedGoroot, "src", "net", "http");
-rmSync(cachedHttp, { recursive: true, force: true });
-cpSync(join(overlayDir, "net", "http"), cachedHttp, { recursive: true });
+function restoreTinyGo() {
+  rmSync(tinygoHttp, { recursive: true, force: true });
+  cpSync(backupHttp, tinygoHttp, { recursive: true });
+}
 
 console.log(`[build-tinygo] Compiling ${userPath} with TinyGo + Zig...`);
 
@@ -94,6 +113,9 @@ const result = spawnSync(
   { cwd: userPath, stdio: "inherit", env: { ...process.env } }
 );
 
+// Restore TinyGo's original net/http
+restoreTinyGo();
+
 if (result.status !== 0) {
   console.error("[build-tinygo] Failed with exit code:", result.status);
   console.error(
@@ -102,6 +124,36 @@ if (result.status !== 0) {
   process.exit(1);
 }
 
+// ============================================================================
+// Asyncify — transform WASM binary so Go can call async JS functions
+// (http.Get, http.Post, etc. suspend WASM, JS does await fetch(), resumes)
+// ============================================================================
+
+const rawWasm = join(buildDir, "go.wasm");
+const asyncWasm = join(buildDir, "go-async.wasm");
+
+console.log("[build-tinygo] Running wasm-opt --asyncify...");
+
+const optResult = spawnSync(
+  "wasm-opt",
+  [
+    rawWasm,
+    "--asyncify",
+    "--pass-arg=asyncify-imports@env.__gomode_fetch",
+    "-o",
+    asyncWasm,
+  ],
+  { stdio: "inherit" }
+);
+
+if (optResult.status !== 0) {
+  console.error("[build-tinygo] wasm-opt --asyncify failed");
+  console.error(
+    "[build-tinygo] Is wasm-opt installed? Install: brew install binaryen"
+  );
+  process.exit(1);
+}
+
 const workerWasm = join(root, "worker", "src", "go.wasm");
-copyFileSync(join(buildDir, "go.wasm"), workerWasm);
+copyFileSync(asyncWasm, workerWasm);
 console.log("[build-tinygo] Output:", workerWasm);
