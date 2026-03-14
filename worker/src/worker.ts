@@ -43,35 +43,19 @@ interface GoWasmExports {
   _start: () => void;
   handle_zerobuf: (reqBase: number) => number;
   malloc: (size: number) => number;
-  asyncify_start_unwind: (dataAddr: number) => void;
-  asyncify_stop_unwind: () => void;
-  asyncify_start_rewind: (dataAddr: number) => void;
-  asyncify_stop_rewind: () => void;
-  asyncify_get_state: () => number;
 }
 
 let wasmExports: GoWasmExports | null = null;
 let initPromise: Promise<void> | null = null;
 let reqScratch = 0;
 
-// Max request scratch: 8 slots (method, path, body, + 5 fan-out results) + 4KB data
-const REQ_SCRATCH_SIZE = 8 * VALUE_SLOT + 4096;
+// Max request scratch: 9 slots (method, path, body, headers, + 5 fan-out results) + 8KB data
+const REQ_SCRATCH_SIZE = 9 * VALUE_SLOT + 8192;
 
 // ============================================================================
-// Asyncify runtime — enables Go code to call async JS functions (fetch, etc.)
+// Two-phase fetch — Go handler calls http.Get(), WASM returns status=-1
+// with fetch params, JS does the fetch, then replays the handler.
 // ============================================================================
-
-const ASYNCIFY_DATA_SIZE = 16384; // 16KB stack save buffer
-let asyncifyDataAddr = 0;
-let asyncifyResuming = false;
-let pendingFetchPromise: Promise<{ status: number; contentType: string; body: string }> | null = null;
-let fetchResponsePtr = 0;
-
-function resetAsyncifyData(): void {
-  const mem = new DataView(wasmExports!.memory.buffer);
-  mem.setInt32(asyncifyDataAddr, asyncifyDataAddr + 8, true);
-  mem.setInt32(asyncifyDataAddr + 4, asyncifyDataAddr + ASYNCIFY_DATA_SIZE, true);
-}
 
 /** Write a fetch response into WASM memory as zerobuf slots for Go to read. */
 function writeFetchResponseToWasm(resp: { status: number; contentType: string; body: string }): number {
@@ -94,27 +78,6 @@ function writeFetchResponseToWasm(resp: { status: number; contentType: string; b
   writeStringSlot(mem, u8, ptr + 2 * VALUE_SLOT, dataOffset, bodyBytes);
 
   return ptr;
-}
-
-/** Call handle_zerobuf with Asyncify suspend/resume support. */
-async function callWasmAsync(reqPtr: number): Promise<number> {
-  let result = wasmExports!.handle_zerobuf(reqPtr);
-
-  while (pendingFetchPromise) {
-    wasmExports!.asyncify_stop_unwind();
-
-    const fetchResult = await pendingFetchPromise;
-    pendingFetchPromise = null;
-
-    fetchResponsePtr = writeFetchResponseToWasm(fetchResult);
-
-    asyncifyResuming = true;
-    resetAsyncifyData();
-    wasmExports!.asyncify_start_rewind(asyncifyDataAddr);
-    result = wasmExports!.handle_zerobuf(reqPtr);
-  }
-
-  return result;
 }
 
 function buildWasiImports(
@@ -196,45 +159,6 @@ async function initWasm(): Promise<void> {
 
   const instance = await WebAssembly.instantiate(goWasmModule, {
     wasi_snapshot_preview1: buildWasiImports(getMemory),
-    env: {
-      __gomode_fetch(
-        urlPtr: number, urlLen: number,
-        methodPtr: number, methodLen: number,
-        bodyPtr: number, bodyLen: number,
-        ctPtr: number, ctLen: number,
-      ): number {
-        if (asyncifyResuming) {
-          asyncifyResuming = false;
-          wasmExports!.asyncify_stop_rewind();
-          return fetchResponsePtr;
-        }
-
-        const buf = wasmExports!.memory.buffer;
-        const url = textDecoder.decode(new Uint8Array(buf, urlPtr, urlLen));
-        const method = textDecoder.decode(new Uint8Array(buf, methodPtr, methodLen));
-        const body = bodyLen > 0 ? textDecoder.decode(new Uint8Array(buf, bodyPtr, bodyLen)) : null;
-        const ct = ctLen > 0 ? textDecoder.decode(new Uint8Array(buf, ctPtr, ctLen)) : undefined;
-
-        const headers: Record<string, string> = {};
-        if (ct) headers["content-type"] = ct;
-
-        pendingFetchPromise = fetch(url, { method, body, headers })
-          .then(async (resp) => ({
-            status: resp.status,
-            contentType: resp.headers.get("content-type") || "",
-            body: await resp.text(),
-          }))
-          .catch((err) => ({
-            status: 0,
-            contentType: "text/plain",
-            body: String(err),
-          }));
-
-        resetAsyncifyData();
-        wasmExports!.asyncify_start_unwind(asyncifyDataAddr);
-        return 0;
-      },
-    },
   });
 
   wasmExports = instance.exports as unknown as GoWasmExports;
@@ -247,10 +171,6 @@ async function initWasm(): Promise<void> {
   }
 
   reqScratch = wasmExports.malloc(REQ_SCRATCH_SIZE);
-
-  // Allocate Asyncify data buffer for suspend/resume
-  asyncifyDataAddr = wasmExports.malloc(ASYNCIFY_DATA_SIZE);
-  resetAsyncifyData();
 }
 
 async function ensureWasm(): Promise<GoWasmExports> {
@@ -315,16 +235,16 @@ interface FanOutItem {
  *
  * Slot layout:
  *   [0] method (string)
- *   [1] path (string)
+ *   [1] path+query (string)
  *   [2] body (string, from request body)
- *   [3..N] fan-out results (string/bytes/i32)
- *
- * Go handler reads slots by index — slot 3 is the first fan-out result.
+ *   [3] headers (string, "Key: Value\n" format)
+ *   [4..N] fan-out results (string/bytes/i32)
  */
 function buildRequest(
   exports: GoWasmExports,
   method: string, pathname: string,
   body?: string | null,
+  headers?: Headers | null,
   fanout?: FanOutItem[]
 ): number {
   const memory = exports.memory;
@@ -332,14 +252,15 @@ function buildRequest(
   const mem = new DataView(buf);
   const u8 = new Uint8Array(buf);
 
-  const numSlots = 3 + (fanout?.length ?? 0);
+  // Always reserve at least 5 slots: method, path, body, headers, fetch-result
+  const numSlots = Math.max(5, 4 + (fanout?.length ?? 0));
   let dataOffset = reqScratch + numSlots * VALUE_SLOT;
 
   // Slot 0: method
   const methodBytes = METHOD_BYTES[method] || textEncoder.encode(method);
   dataOffset = writeStringSlot(mem, u8, reqScratch, dataOffset, methodBytes);
 
-  // Slot 1: path
+  // Slot 1: path+query
   const pathBytes = textEncoder.encode(pathname);
   dataOffset = writeStringSlot(mem, u8, reqScratch + VALUE_SLOT, dataOffset, pathBytes);
 
@@ -347,10 +268,24 @@ function buildRequest(
   const bodyBytes = body ? textEncoder.encode(body) : new Uint8Array(0);
   dataOffset = writeStringSlot(mem, u8, reqScratch + 2 * VALUE_SLOT, dataOffset, bodyBytes);
 
-  // Slots 3+: fan-out results
+  // Slot 3: headers
+  let headerStr = "";
+  if (headers) {
+    headers.forEach((value, key) => {
+      headerStr += key + ": " + value + "\n";
+    });
+  }
+  const headerBytes = textEncoder.encode(headerStr);
+  dataOffset = writeStringSlot(mem, u8, reqScratch + 3 * VALUE_SLOT, dataOffset, headerBytes);
+
+  // Slot 4: fetch result (zero = no pending fetch, set by two-phase protocol)
+  mem.setUint8(reqScratch + 4 * VALUE_SLOT, 0);
+  mem.setUint32(reqScratch + 4 * VALUE_SLOT + 4, 0, true);
+
+  // Slots 5+: fan-out results
   if (fanout) {
     for (let i = 0; i < fanout.length; i++) {
-      const slot = reqScratch + (3 + i) * VALUE_SLOT;
+      const slot = reqScratch + (5 + i) * VALUE_SLOT;
       const item = fanout[i];
       if (item.type === "string") {
         const bytes = textEncoder.encode(item.value as string);
@@ -366,8 +301,16 @@ function buildRequest(
   return reqScratch;
 }
 
-/** Read response from WASM memory. */
-function readResponse(exports: GoWasmExports, respPtr: number): Response {
+/** Raw response fields read from WASM memory. */
+interface WasmResponse {
+  status: number;
+  contentType: string;
+  body: string;
+  headers: Headers;
+}
+
+/** Read raw response fields from WASM memory zerobuf slots. */
+function readRawResponse(exports: GoWasmExports, respPtr: number): WasmResponse {
   const buf = exports.memory.buffer;
   const mem = new DataView(buf);
 
@@ -381,10 +324,34 @@ function readResponse(exports: GoWasmExports, respPtr: number): Response {
   const bodyLen = mem.getUint32(bodyPtr, true);
   const body = textDecoder.decode(new Uint8Array(buf, bodyPtr + STRING_HEADER, bodyLen));
 
-  return new Response(body, {
-    status,
-    headers: { "content-type": contentType },
-  });
+  const respHeaders = new Headers();
+  respHeaders.set("content-type", contentType);
+  const hdrsTag = mem.getUint8(respPtr + 3 * VALUE_SLOT);
+  if (hdrsTag === TAG_STRING) {
+    const hdrsDataPtr = mem.getUint32(respPtr + 3 * VALUE_SLOT + 4, true);
+    const hdrsLen = mem.getUint32(hdrsDataPtr, true);
+    if (hdrsLen > 0) {
+      const hdrsStr = textDecoder.decode(new Uint8Array(buf, hdrsDataPtr + STRING_HEADER, hdrsLen));
+      for (const line of hdrsStr.split("\n")) {
+        const colonIdx = line.indexOf(": ");
+        if (colonIdx > 0) {
+          const key = line.slice(0, colonIdx).toLowerCase();
+          const val = line.slice(colonIdx + 2);
+          if (key !== "content-type") {
+            respHeaders.append(key, val);
+          }
+        }
+      }
+    }
+  }
+
+  return { status, contentType, body, headers: respHeaders };
+}
+
+/** Convert raw response to a Web API Response object. */
+function toResponse(raw: WasmResponse): Response {
+  const nullBodyStatus = raw.status === 101 || raw.status === 204 || raw.status === 205 || raw.status === 304;
+  return new Response(nullBodyStatus ? null : raw.body, { status: raw.status, headers: raw.headers });
 }
 
 // ============================================================================
@@ -419,12 +386,42 @@ async function handleWithFanout(
   }
 
   // Build request with fan-out results already in WASM memory
-  const reqPtr = buildRequest(exports, request.method, pathname, body, fanout);
+  const reqPtr = buildRequest(exports, request.method, pathname, body, request.headers, fanout);
 
-  // Call WASM with Asyncify support — suspends if Go calls http.Get() etc.
-  const respPtr = await callWasmAsync(reqPtr);
+  // Phase 1: call WASM handler
+  let respPtr = exports.handle_zerobuf(reqPtr);
+  let raw = readRawResponse(exports, respPtr);
 
-  return readResponse(exports, respPtr);
+  // Two-phase fetch: status=-1 means the handler needs an outbound fetch.
+  // Body contains the fetch URL, content-type field contains the HTTP method.
+  if (raw.status === -1) {
+    const fetchUrl = raw.body.trim();
+    const fetchMethod = raw.contentType.trim() || "GET";
+
+    const fetchResp = await fetch(fetchUrl, { method: fetchMethod }).catch((err) =>
+      new Response(String(err), { status: 502, headers: { "content-type": "text/plain" } })
+    );
+    const fetchBody = await fetchResp.text();
+    const fetchCt = fetchResp.headers.get("content-type") || "";
+
+    // Write fetch result into WASM memory as zerobuf slots
+    const fetchResultPtr = writeFetchResponseToWasm({
+      status: fetchResp.status,
+      contentType: fetchCt,
+      body: fetchBody,
+    });
+
+    // Phase 2: replay with fetch result pointer in slot 4
+    const reqPtr2 = buildRequest(exports, request.method, pathname, body, request.headers, fanout);
+    const mem = new DataView(exports.memory.buffer);
+    mem.setUint8(reqPtr2 + 4 * VALUE_SLOT, TAG_STRING);
+    mem.setUint32(reqPtr2 + 4 * VALUE_SLOT + 4, fetchResultPtr, true);
+
+    respPtr = exports.handle_zerobuf(reqPtr2);
+    raw = readRawResponse(exports, respPtr);
+  }
+
+  return toResponse(raw);
 }
 
 /**

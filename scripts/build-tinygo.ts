@@ -124,36 +124,6 @@ if (result.status !== 0) {
   process.exit(1);
 }
 
-// ============================================================================
-// Asyncify — transform WASM binary so Go can call async JS functions
-// (http.Get, http.Post, etc. suspend WASM, JS does await fetch(), resumes)
-// ============================================================================
-
-const rawWasm = join(buildDir, "go.wasm");
-const asyncWasm = join(buildDir, "go-async.wasm");
-
-console.log("[build-tinygo] Running wasm-opt --asyncify...");
-
-const optResult = spawnSync(
-  "wasm-opt",
-  [
-    rawWasm,
-    "--asyncify",
-    "--pass-arg=asyncify-imports@env.__gomode_fetch",
-    "-o",
-    asyncWasm,
-  ],
-  { stdio: "inherit" }
-);
-
-if (optResult.status !== 0) {
-  console.error("[build-tinygo] wasm-opt --asyncify failed");
-  console.error(
-    "[build-tinygo] Is wasm-opt installed? Install: brew install binaryen"
-  );
-  process.exit(1);
-}
-
 const workerWasm = join(root, "worker", "src", "go.wasm");
-copyFileSync(asyncWasm, workerWasm);
+copyFileSync(join(buildDir, "go.wasm"), workerWasm);
 console.log("[build-tinygo] Output:", workerWasm);

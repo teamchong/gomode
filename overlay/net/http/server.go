@@ -17,7 +17,7 @@ const (
 	zbStringHeader = 4
 )
 
-var respBuf [8192]byte
+var respBuf [16384]byte
 
 // ---------------------------------------------------------------------------
 // Header — case-insensitive, same as net/http.Header
@@ -509,9 +509,9 @@ func (r *Request) ProtoAtLeast(major, minor int) bool {
 }
 
 // FanoutString reads a fan-out result from the request.
-// Index 0 = first fan-out result (JS slot 3). GoMode extension.
+// Index 0 = first fan-out result (JS slot 5). GoMode extension.
 func (r *Request) FanoutString(index int) string {
-	return readZBString(uintptr(r.reqBase) + uintptr((3+index)*zbValueSlot))
+	return readZBString(uintptr(r.reqBase) + uintptr((5+index)*zbValueSlot))
 }
 
 // ---------------------------------------------------------------------------
@@ -761,13 +761,44 @@ func readZBString(slotAddr uintptr) string {
 	return string(bytes)
 }
 
-func writeZerobufResponse(status int32, contentType string, body string) uint32 {
+func serializeHeaders(h Header) string {
+	var s string
+	for key, values := range h {
+		for _, v := range values {
+			s += key + ": " + v + "\n"
+		}
+	}
+	return s
+}
+
+func parseHeaderString(s string) Header {
+	h := Header{}
+	for s != "" {
+		var line string
+		i := strings.IndexByte(s, '\n')
+		if i < 0 {
+			line = s
+			s = ""
+		} else {
+			line = s[:i]
+			s = s[i+1:]
+		}
+		j := strings.Index(line, ": ")
+		if j < 0 {
+			continue
+		}
+		h.Add(line[:j], line[j+2:])
+	}
+	return h
+}
+
+func writeZerobufResponse(status int32, contentType string, body string, headers string) uint32 {
 	base := uintptr(unsafe.Pointer(&respBuf[0]))
 
 	*(*uint8)(unsafe.Pointer(base)) = zbTagI32
 	*(*int32)(unsafe.Pointer(base + 4)) = status
 
-	dataOffset := uintptr(48)
+	dataOffset := uintptr(64) // 4 slots * 16 bytes
 
 	ctPtr := base + dataOffset
 	*(*uint32)(unsafe.Pointer(ctPtr)) = uint32(len(contentType))
@@ -782,11 +813,30 @@ func writeZerobufResponse(status int32, contentType string, body string) uint32 
 	copy(unsafe.Slice((*byte)(unsafe.Pointer(bodyPtr+zbStringHeader)), len(body)), body)
 	*(*uint8)(unsafe.Pointer(base + 2*zbValueSlot)) = zbTagString
 	*(*uint32)(unsafe.Pointer(base + 2*zbValueSlot + 4)) = uint32(bodyPtr)
+	dataOffset += zbStringHeader + uintptr(len(body))
+	dataOffset = (dataOffset + 3) &^ 3
+
+	hdrsPtr := base + dataOffset
+	*(*uint32)(unsafe.Pointer(hdrsPtr)) = uint32(len(headers))
+	copy(unsafe.Slice((*byte)(unsafe.Pointer(hdrsPtr+zbStringHeader)), len(headers)), headers)
+	*(*uint8)(unsafe.Pointer(base + 3*zbValueSlot)) = zbTagString
+	*(*uint32)(unsafe.Pointer(base + 3*zbValueSlot + 4)) = uint32(hdrsPtr)
 
 	return uint32(base)
 }
 
 // HandleRequest is called by the WASM export. Routes through mux or custom handler.
+//
+// Two-phase fetch protocol:
+//   Phase 1: Handler runs. If it calls http.Get(), doFetch sets fetchPending=true
+//   and the handler finishes with a dummy response. HandleRequest detects this
+//   and returns status=-1 with the fetch URL/method serialized in the body.
+//   JS reads the fetch params, does the actual fetch, writes the result as
+//   zerobuf slots at fan-out slot 4, and re-calls handle_zerobuf.
+//
+//   Phase 2 (replay): HandleRequest reads the fetch result from slot 4,
+//   sets fetchResult, and re-runs the handler. doFetch returns the cached
+//   result. The handler completes normally.
 func HandleRequest(reqBase uint32) uint32 {
 	reqAddr := uintptr(reqBase)
 
@@ -798,21 +848,39 @@ func HandleRequest(reqBase uint32) uint32 {
 		urlPath = rawPath[:qi]
 		rawQuery = rawPath[qi+1:]
 	}
+	hdrs := parseHeaderString(readZBString(reqAddr + 3*zbValueSlot))
+
+	// Check if this is a phase-2 replay with fetch result in slot 4
+	fetchSlotAddr := reqAddr + 4*zbValueSlot
+	fetchSlotTag := *(*uint8)(unsafe.Pointer(fetchSlotAddr))
+	if fetchSlotTag == zbTagString {
+		// Slot 4 contains the fetch result as zerobuf sub-slots
+		fetchResultPtr := uintptr(*(*uint32)(unsafe.Pointer(fetchSlotAddr + 4)))
+		fetchResult = readFetchResponse(fetchResultPtr)
+	}
+
 	req := &Request{
 		Method:      readZBString(reqAddr + 0*zbValueSlot),
 		URL:         &URL{Path: urlPath, RawQuery: rawQuery},
 		Proto:       "HTTP/1.1",
 		ProtoMajor:  1,
 		ProtoMinor:  1,
-		Header:      Header{},
+		Header:      hdrs,
 		Body:        &stringReader{s: bodyStr},
 		bodyStr:     bodyStr,
 		reqBase:     reqBase,
 		RemoteAddr:  "",
 	}
 	req.ContentLength = int64(len(bodyStr))
-	req.Host = req.URL.Host
+	host := hdrs.Get("Host")
+	if host != "" {
+		req.Host = host
+	} else {
+		req.Host = req.URL.Host
+	}
 	req.RequestURI = req.URL.RequestURI()
+
+	fetchPending = false
 
 	w := &responseWriter{
 		headers:    Header{},
@@ -825,10 +893,18 @@ func HandleRequest(reqBase uint32) uint32 {
 		defaultServeMux.ServeHTTP(w, req)
 	}
 
+	// If the handler triggered a fetch, return a special response
+	// so JS knows to do the fetch and replay.
+	if fetchPending {
+		fetchPending = false
+		// Return status=-1 with fetch URL in body and method in content-type
+		return writeZerobufResponse(-1, fetchMethod, fetchURL, "")
+	}
+
 	ct := w.headers.Get("Content-Type")
 	if ct == "" {
 		ct = DetectContentType(w.body)
 	}
 
-	return writeZerobufResponse(int32(w.statusCode), ct, string(w.body))
+	return writeZerobufResponse(int32(w.statusCode), ct, string(w.body), serializeHeaders(w.headers))
 }

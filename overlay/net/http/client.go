@@ -27,30 +27,43 @@ type Client struct {
 
 var DefaultClient = &Client{}
 
-//go:wasmimport env __gomode_fetch
-func gomodeFetch(urlPtr, urlLen, methodPtr, methodLen, bodyPtr, bodyLen, ctPtr, ctLen uint32) uint32
+// Two-phase fetch protocol (no Asyncify needed):
+//
+// Phase 1: Go handler calls http.Get() → doFetch stores the outbound URL and
+// method in fetchURL/fetchMethod and sets fetchPending=true. The handler runs
+// to completion with a zero-status Response. HandleRequest detects fetchPending
+// and returns status=-1 to JS with the fetch URL in the body.
+//
+// JS reads the fetch params from the response, performs the actual fetch(),
+// writes the result into WASM memory as zerobuf slots, then re-calls
+// handle_zerobuf with the fetch result pointer in slot 4.
+//
+// Phase 2 (replay): HandleRequest reads the fetch result from slot 4,
+// sets fetchResult, and re-runs the handler. doFetch returns the cached
+// result. The handler completes normally.
 
-func ptrOf(b []byte) uint32 {
-	if len(b) == 0 {
-		return 0
-	}
-	return uint32(uintptr(unsafe.Pointer(&b[0])))
-}
+var fetchURL string
+var fetchMethod string
+var fetchPending bool
+var fetchResult *Response
 
 func doFetch(method, rawurl, body, contentType string) (*Response, error) {
-	urlB := []byte(rawurl)
-	methodB := []byte(method)
-	bodyB := []byte(body)
-	ctB := []byte(contentType)
+	// Replay phase: JS already did the fetch and injected the result
+	if fetchResult != nil {
+		r := fetchResult
+		fetchResult = nil
+		return r, nil
+	}
 
-	respPtr := gomodeFetch(
-		ptrOf(urlB), uint32(len(urlB)),
-		ptrOf(methodB), uint32(len(methodB)),
-		ptrOf(bodyB), uint32(len(bodyB)),
-		ptrOf(ctB), uint32(len(ctB)),
-	)
+	// First phase: store the URL and method for HandleRequest to read
+	fetchURL = rawurl
+	fetchMethod = method
+	fetchPending = true
 
-	return readFetchResponse(uintptr(respPtr)), nil
+	// Return a zero-status response. The handler will finish running,
+	// and HandleRequest will detect fetchPending and return status=-1
+	// with the fetch URL/method serialized for JS.
+	return &Response{StatusCode: 0}, nil
 }
 
 func readFetchResponse(base uintptr) *Response {
