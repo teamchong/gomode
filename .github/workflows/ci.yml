@@ -29,6 +29,7 @@ jobs:
         run: |
           wget -q https://github.com/tinygo-org/tinygo/releases/download/v0.40.1/tinygo_0.40.1_amd64.deb -O /tmp/tinygo.deb
           sudo dpkg -i /tmp/tinygo.deb
+          sudo chmod -R a+rw $(tinygo env TINYGOROOT)/src
           tinygo version
 
       - name: Install npm dependencies
