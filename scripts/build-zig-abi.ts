@@ -4,7 +4,7 @@
  *
  * This is the Zig component that provides:
  * - Memory management (zig_alloc, zig_free, zig_free_result)
- * - Columnar table ABI (zig_table_*)
+ * - SIMD batch operations (zig_simd_*)
  * - HTTP fetch (zig_http_fetch)
  * - Host import forwarding
  */
@@ -30,6 +30,7 @@ const result = spawnSync(
     join(zigSrc, "main.zig"),
     "-target",
     "wasm32-wasi",
+    "-mcpu=generic+simd128",
     "-O",
     "ReleaseSmall",
     "--name",

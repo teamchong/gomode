@@ -12,10 +12,13 @@
     "deploy": "cd worker && npx wrangler deploy"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250109.0",
     "tsx": "^4.19.0",
     "typescript": "^5.5.0",
     "vitest": "^2.1.0",
-    "wrangler": "^4.0.0",
-    "@cloudflare/workers-types": "^4.20250109.0"
+    "wrangler": "^4.0.0"
+  },
+  "dependencies": {
+    "zerobuf": "^0.1.0"
   }
 }

@@ -9,6 +9,7 @@
 
 export { GoDO } from "./go-do";
 import goWasmModule from "./go.wasm";
+import { Arena, defineSchema } from "zerobuf";
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -22,12 +23,18 @@ interface GoWasmExports {
   _start: () => void;
   gomode_malloc: (size: number) => number;
   handle: (reqPtr: number, reqLen: number) => number;
+  handle_zerobuf: (reqBase: number) => number;
   getResponsePtr: () => number;
 }
+
+// Zerobuf schemas — compiled once, reused across requests
+const RequestSchema = defineSchema<{ method: string; path: string }>(["method", "path"]);
+const ResponseSchema = defineSchema<{ status: number; contentType: string; body: string }>(["status", "contentType", "body"]);
 
 // Cache WASM instance at module level — reused across requests in same isolate
 let wasmExports: GoWasmExports | null = null;
 let initPromise: Promise<void> | null = null;
+let zbArena: Arena | null = null;
 
 function buildWasiImports(
   getMemory: () => WebAssembly.Memory
@@ -141,13 +148,16 @@ async function initWasm(): Promise<void> {
   }
 }
 
-async function handleDirect(request: Request): Promise<Response> {
+async function ensureWasm(): Promise<GoWasmExports> {
   if (!wasmExports) {
     if (!initPromise) initPromise = initWasm();
     await initPromise;
   }
+  return wasmExports!;
+}
 
-  const exports = wasmExports!;
+async function handleDirect(request: Request): Promise<Response> {
+  const exports = await ensureWasm();
   const url = new URL(request.url);
   const headers: Record<string, string> = {};
   request.headers.forEach((v, k) => { headers[k] = v; });
@@ -186,21 +196,65 @@ async function handleDirect(request: Request): Promise<Response> {
   }
 }
 
+/**
+ * Zero-copy path via zerobuf — no JSON serialization anywhere.
+ *
+ * JS writes request fields as tagged values directly into WASM memory.
+ * Go reads at fixed offsets, writes response at fixed offsets.
+ * JS reads response fields directly — no parse, no copy.
+ */
+async function handleDirectZB(request: Request, pathname: string): Promise<Response> {
+  const exports = await ensureWasm();
+
+  // Initialize arena over WASM memory (start at 1MB to avoid TinyGo heap)
+  if (!zbArena) {
+    zbArena = new Arena(exports.memory, 1024 * 1024);
+  }
+
+  // Save arena checkpoint for per-request cleanup
+  const checkpoint = zbArena.save();
+
+  try {
+    const innerPath = pathname;
+
+    // Write request as zerobuf schema directly into WASM memory
+    const req = RequestSchema.create(zbArena, {
+      method: request.method,
+      path: innerPath,
+    });
+
+    // Call Go handler — passes pointer to request tagged values,
+    // returns pointer to response tagged values
+    const reqPtr = (req as unknown as { __zerobuf_ptr: number }).__zerobuf_ptr;
+    const respPtr = exports.handle_zerobuf(reqPtr);
+
+    // Read response directly from WASM memory — zero copy
+    const resp = ResponseSchema.toJS(zbArena, respPtr);
+
+    return new Response(resp.body, {
+      status: resp.status,
+      headers: { "content-type": resp.contentType },
+    });
+  } finally {
+    // Restore arena — free all per-request allocations
+    zbArena.restore(checkpoint);
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // /do/* → Durable Object (stateful)
+    // /do/* → Durable Object (stateful, JSON path)
     if (url.pathname.startsWith("/do/")) {
       const id = env.GO_DO.idFromName("singleton");
       const durable = env.GO_DO.get(id);
-      // Rewrite path: /do/json → /json
       const innerUrl = new URL(request.url);
       innerUrl.pathname = url.pathname.slice(3) || "/";
       return durable.fetch(new Request(innerUrl.toString(), request));
     }
 
-    // Everything else → direct WASM (stateless, max concurrency)
-    return handleDirect(request);
+    // Everything else → zerobuf zero-copy (default)
+    return handleDirectZB(request, url.pathname);
   },
 };
