@@ -20,5 +20,8 @@
   },
   "dependencies": {
     "zerobuf": "^0.1.0"
+  },
+  "overrides": {
+    "undici": "^7.24.0"
   }
 }
