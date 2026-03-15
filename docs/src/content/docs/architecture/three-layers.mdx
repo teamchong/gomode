@@ -52,47 +52,75 @@ Go passes raw pointers to Zig — same linear memory, zero copy.
 
 **`worker.ts`** — Entry point. Routes requests to direct WASM or Durable Object. Uses zerobuf to write request fields and read response fields directly in WASM memory. Only provides 3 WASI imports (`fd_write`, `proc_exit`, `random_get`).
 
-**`go-do.ts`** — Durable Object. Instantiates WASM once, keeps it alive.
+**`go-do.ts`** — Durable Object. Full parity with worker path — body, headers, cookies, multi-fetch, zero-copy responses. WASM instance persists for DO lifetime.
 
 ### Zero-copy data exchange
 
-Request and response schemas are defined once and reused:
+JS writes request fields directly into WASM memory as zerobuf tagged value slots (16 bytes each). Go reads at fixed offsets. Response body is read as `Uint8Array` — no string decode/re-encode.
 
-```typescript
-import { Arena, defineSchema } from "zerobuf";
+```
+Request:  [0]=method  [1]=path+query  [2]=body  [3]=headers  [4]=fetch-result  [5]=call-index  [6+]=fan-out
+Response: [0]=status   [1]=content-type  [2]=body  [3]=headers
+```
 
-const RequestSchema = defineSchema(["method", "path"]);
-const ResponseSchema = defineSchema(["status", "contentType", "body"]);
+### Multi-fetch two-phase protocol
 
-// Per request:
-const req = RequestSchema.create(arena, { method: "GET", path: "/simd" });
-const respPtr = exports.handle_zerobuf(req.__zerobuf_ptr);
-const resp = ResponseSchema.toJS(arena, respPtr);
-// resp.status, resp.body — read directly from WASM memory
+Go handlers can call `http.Get()` multiple times. Each call triggers one JS round-trip — no Asyncify needed.
+
+```
+Handler calls http.Get(url1) → returns status=-1, JS fetches url1, replays
+Handler calls http.Get(url1) → cached ✓, calls http.Get(url2) → returns status=-1, JS fetches url2, replays
+Handler calls http.Get(url1) → cached ✓, calls http.Get(url2) → cached ✓ → handler completes
 ```
 
 ## Layer 3: Go + Zig Handler (`examples/hello-worker/`)
 
-Go exports `handle_zerobuf()` which reads request fields from zerobuf tagged value slots, processes (optionally calling Zig SIMD), and writes response at fixed offsets.
+Standard Go `net/http` handlers run unchanged on GoMode. The overlay replaces `net/http` at build time with a WASM-compatible implementation that uses the same types and interfaces.
 
 ```go
+package main
+
+import (
+  "encoding/json"
+  "gomode"
+  "net/http"
+)
+
+func main() {
+  http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+    w.Write([]byte("Hello from GoMode!"))
+  })
+
+  http.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
+    data := []float64{1, 2, 3, 4, 5, 6, 7, 8}
+    sum := gomode.SumF64(data)       // Zig SIMD
+    min, max := gomode.MinMaxF64(data) // Zig SIMD
+
+    json.NewEncoder(w).Encode(map[string]float64{
+      "sum": sum, "min": min, "max": max,
+    })
+  })
+
+  http.HandleFunc("/exchange", func(w http.ResponseWriter, r *http.Request) {
+    // Outbound fetch — triggers multi-fetch two-phase protocol
+    resp, err := http.Get("https://api.example.com/rates")
+    if err != nil {
+      http.Error(w, err.Error(), 502)
+      return
+    }
+    // Process resp.Body as normal...
+  })
+
+  http.ListenAndServe(":8080", nil)
+}
+
 //export handle_zerobuf
 func handleZerobuf(reqBase uint32) uint32 {
-  path := readZBString(uintptr(reqBase) + 1*16)
-
-  switch path {
-  case "/simd":
-    data := []float64{1, 2, 3, 4, 5, 6, 7, 8}
-    sum := gomode.ZigSimdSumF64(
-      uint32(uintptr(unsafe.Pointer(&data[0]))),
-      uint32(len(data)),
-    )
-    return writeResponse(200, "text/plain", formatFloat(sum))
-  }
+  return http.HandleRequest(reqBase)
 }
 ```
 
-Go calls Zig via CGo — the C header declares Zig function signatures:
+Go calls Zig SIMD via CGo — the C header declares Zig function signatures, and TinyGo's `wasm-ld` links both into one binary:
 
 ```c
 // go-sdk/zig_abi.h
@@ -101,13 +129,9 @@ double zig_simd_dot_f64(uint32_t a, uint32_t b, uint32_t count);
 ```
 
 ```go
-// go-sdk/gomode.go
-/*
-#include "zig_abi.h"
-*/
-import "C"
-
-func ZigSimdSumF64(ptr uint32, count uint32) float64 {
-  return float64(C.zig_simd_sum_f64(C.uint32_t(ptr), C.uint32_t(count)))
-}
+// go-sdk/gomode.go — high-level API wrapping CGo calls
+func SumF64(data []float64) float64
+func DotF64(a, b []float64) float64
+func MinMaxF64(data []float64) (min, max float64)
+func ScaleF64(data []float64, scalar float64)
 ```
