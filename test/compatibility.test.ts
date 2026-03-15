@@ -256,3 +256,22 @@ describe("Request reflection", () => {
     expect(data.content_len).toBe(body.length);
   });
 });
+
+describe("Panic recovery", () => {
+  it("returns 500 with panic message instead of crashing", async () => {
+    const res = await fetch(`${BASE}/panic`);
+    expect(res.status).toBe(500);
+    const body = await res.text();
+    expect(body).toContain("panic:");
+  });
+
+  it("still serves normal requests after a panic", async () => {
+    // First trigger a panic
+    await fetch(`${BASE}/panic`);
+    // Then verify the server still works
+    const res = await fetch(`${BASE}/json`);
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.message).toBe("Hello from GoMode!");
+  });
+});

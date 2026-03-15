@@ -401,7 +401,16 @@ async function handleWithFanout(
   const reqPtr = buildRequest(exports, request.method, pathname, body, request.headers, fanout);
 
   // Call WASM handler — loop for multi-fetch (each http.Get() = one round-trip)
-  let respPtr = exports.handle_zerobuf(reqPtr);
+  let respPtr: number;
+  try {
+    respPtr = exports.handle_zerobuf(reqPtr);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return new Response(`panic: ${msg}`, {
+      status: 500,
+      headers: { "content-type": "text/plain; charset=utf-8" },
+    });
+  }
   let raw = readRawResponse(exports, respPtr);
 
   // Multi-fetch loop: status=-1 means the handler needs an outbound fetch.
@@ -455,7 +464,15 @@ async function handleWithFanout(
     // Slot 5: call index (i32) — Go uses this to cache result by call order
     writeI32Slot(mem, reqPtr2 + 5 * VALUE_SLOT, callIndex);
 
-    respPtr = exports.handle_zerobuf(reqPtr2);
+    try {
+      respPtr = exports.handle_zerobuf(reqPtr2);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return new Response(`panic: ${msg}`, {
+        status: 500,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      });
+    }
     raw = readRawResponse(exports, respPtr);
   }
 

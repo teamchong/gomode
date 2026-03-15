@@ -424,6 +424,11 @@ func main() {
 		})
 	})
 
+	// Panic recovery test — handler panics, should get 500 response
+	http.HandleFunc("/panic", func(w http.ResponseWriter, r *http.Request) {
+		panic("test panic from handler")
+	})
+
 	// POST fetch — outbound http.Post with body forwarding
 	http.HandleFunc("/post-fetch", func(w http.ResponseWriter, r *http.Request) {
 		url := r.FormValue("url")

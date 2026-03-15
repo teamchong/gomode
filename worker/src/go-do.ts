@@ -181,7 +181,16 @@ export class GoDO implements DurableObject {
     const reqPtr = this.buildRequest(exports, request.method, pathAndQuery, body, request.headers);
 
     // Call WASM handler with multi-fetch loop
-    let respPtr = exports.handle_zerobuf(reqPtr);
+    let respPtr: number;
+    try {
+      respPtr = exports.handle_zerobuf(reqPtr);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return new Response(`panic: ${msg}`, {
+        status: 500,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      });
+    }
     let raw = readRawResponse(exports, respPtr);
 
     while (raw.status === -1) {
@@ -225,7 +234,15 @@ export class GoDO implements DurableObject {
       mem.setUint32(reqPtr2 + 4 * VALUE_SLOT + 4, fetchResultPtr, true);
       writeI32Slot(mem, reqPtr2 + 5 * VALUE_SLOT, callIndex);
 
-      respPtr = exports.handle_zerobuf(reqPtr2);
+      try {
+        respPtr = exports.handle_zerobuf(reqPtr2);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return new Response(`panic: ${msg}`, {
+          status: 500,
+          headers: { "content-type": "text/plain; charset=utf-8" },
+        });
+      }
       raw = readRawResponse(exports, respPtr);
     }
 
