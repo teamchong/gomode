@@ -7,6 +7,7 @@
 
 const std = @import("std");
 pub const simd = @import("simd.zig");
+pub const crypto = @import("crypto.zig");
 pub const bump = @import("allocator.zig");
 
 // Force allocator exports (malloc, free, calloc, realloc, zig_heap_*)
@@ -123,4 +124,16 @@ export fn zig_simd_clamp_f64(ptr: u32, count: u32, lo: f64, hi: f64) void {
 export fn zig_simd_map_linear_f64(ptr: u32, count: u32, a: f64, b: f64) void {
     if (ptr == 0 or count == 0) return;
     simd.mapLinearF64(ptrToF64SliceMut(ptr, count), a, b);
+}
+
+// ============================================================================
+// Crypto Operations
+// ============================================================================
+
+export fn zig_hmac_sha256(key_ptr: u32, key_len: u32, msg_ptr: u32, msg_len: u32, out_ptr: u32) void {
+    if (key_ptr == 0 or msg_ptr == 0 or out_ptr == 0) return;
+    const key = @as([*]const u8, @ptrFromInt(key_ptr))[0..key_len];
+    const msg = @as([*]const u8, @ptrFromInt(msg_ptr))[0..msg_len];
+    const out = @as([*]u8, @ptrFromInt(out_ptr))[0..32];
+    crypto.hmacSha256(key, msg, out);
 }

@@ -424,6 +424,25 @@ func main() {
 		})
 	})
 
+	// HMAC-SHA256 via Zig crypto
+	http.HandleFunc("/hmac", func(w http.ResponseWriter, r *http.Request) {
+		key := r.FormValue("key")
+		msg := r.FormValue("msg")
+		if key == "" {
+			key = "secret"
+		}
+		if msg == "" {
+			msg = "hello"
+		}
+		mac := gomode.HmacSHA256Hex([]byte(key), []byte(msg))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"key":  key,
+			"msg":  msg,
+			"hmac": mac,
+		})
+	})
+
 	// WebSocket echo — DO mode only (method = "WEBSOCKET" for messages)
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "WEBSOCKET" {

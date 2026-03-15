@@ -87,3 +87,9 @@ func ZigSimdClampF64(ptr uint32, count uint32, lo float64, hi float64) {
 func ZigSimdMapLinearF64(ptr uint32, count uint32, a float64, b float64) {
 	C.zig_simd_map_linear_f64(C.uint32_t(ptr), C.uint32_t(count), C.double(a), C.double(b))
 }
+
+// --- Crypto Operations ---
+
+func ZigHmacSha256(keyPtr uint32, keyLen uint32, msgPtr uint32, msgLen uint32, outPtr uint32) {
+	C.zig_hmac_sha256(C.uint32_t(keyPtr), C.uint32_t(keyLen), C.uint32_t(msgPtr), C.uint32_t(msgLen), C.uint32_t(outPtr))
+}

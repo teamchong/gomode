@@ -34,4 +34,7 @@ void zig_simd_mul_f64(uint32_t dst, uint32_t a, uint32_t b, uint32_t count);
 void zig_simd_clamp_f64(uint32_t ptr, uint32_t count, double lo, double hi);
 void zig_simd_map_linear_f64(uint32_t ptr, uint32_t count, double a, double b);
 
+// Crypto operations
+void zig_hmac_sha256(uint32_t key_ptr, uint32_t key_len, uint32_t msg_ptr, uint32_t msg_len, uint32_t out_ptr);
+
 #endif

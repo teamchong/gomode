@@ -289,6 +289,21 @@ describe("net/http conformance", () => {
     });
   });
 
+  // ---- HMAC ----
+
+  describe("Zig HMAC-SHA256", () => {
+    it("computes correct HMAC-SHA256", async () => {
+      const resp = await fetch(`${BASE}/hmac?key=secret&msg=hello`);
+      const data = await resp.json();
+      expect(data.key).toBe("secret");
+      expect(data.msg).toBe("hello");
+      // Known HMAC-SHA256("secret", "hello") value
+      expect(data.hmac).toBe(
+        "88aab3ede8d3adf94d26ab90d3bafd4a2083070c3bcce9c014ee04a443847c0b"
+      );
+    });
+  });
+
   // ---- SIMD ----
 
   describe("Zig SIMD operations", () => {
