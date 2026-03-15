@@ -93,3 +93,15 @@ func ZigSimdMapLinearF64(ptr uint32, count uint32, a float64, b float64) {
 func ZigHmacSha256(keyPtr uint32, keyLen uint32, msgPtr uint32, msgLen uint32, outPtr uint32) {
 	C.zig_hmac_sha256(C.uint32_t(keyPtr), C.uint32_t(keyLen), C.uint32_t(msgPtr), C.uint32_t(msgLen), C.uint32_t(outPtr))
 }
+
+func ZigSha512(dataPtr uint32, dataLen uint32, outPtr uint32) {
+	C.zig_sha512(C.uint32_t(dataPtr), C.uint32_t(dataLen), C.uint32_t(outPtr))
+}
+
+func ZigAes256GcmEncrypt(keyPtr uint32, noncePtr uint32, ptPtr uint32, ptLen uint32, aadPtr uint32, aadLen uint32, outPtr uint32) uint32 {
+	return uint32(C.zig_aes256gcm_encrypt(C.uint32_t(keyPtr), C.uint32_t(noncePtr), C.uint32_t(ptPtr), C.uint32_t(ptLen), C.uint32_t(aadPtr), C.uint32_t(aadLen), C.uint32_t(outPtr)))
+}
+
+func ZigAes256GcmDecrypt(keyPtr uint32, noncePtr uint32, ctPtr uint32, ctLen uint32, aadPtr uint32, aadLen uint32, outPtr uint32) uint32 {
+	return uint32(C.zig_aes256gcm_decrypt(C.uint32_t(keyPtr), C.uint32_t(noncePtr), C.uint32_t(ctPtr), C.uint32_t(ctLen), C.uint32_t(aadPtr), C.uint32_t(aadLen), C.uint32_t(outPtr)))
+}

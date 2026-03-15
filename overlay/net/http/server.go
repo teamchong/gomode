@@ -5,6 +5,8 @@ package http
 
 import (
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"unsafe"
 )
@@ -539,6 +541,14 @@ type ResponseWriter interface {
 	WriteHeader(statusCode int)
 }
 
+// Flusher is implemented by ResponseWriters that allow flushing buffered data.
+// In GoMode, Flush() is a no-op — the response is sent in full after the handler
+// returns. SSE patterns work by writing the complete event stream and returning
+// it with content-type "text/event-stream". The JS layer delivers it via ReadableStream.
+type Flusher interface {
+	Flush()
+}
+
 type responseWriter struct {
 	headers    Header
 	statusCode int
@@ -566,6 +576,11 @@ func (w *responseWriter) WriteHeader(statusCode int) {
 	w.statusCode = statusCode
 	w.wroteHead = true
 }
+
+// Flush implements http.Flusher. In GoMode, the complete response is sent
+// after the handler returns. Flush is a no-op that satisfies the interface
+// so SSE and chunked-write patterns compile and run correctly.
+func (w *responseWriter) Flush() {}
 
 // ---------------------------------------------------------------------------
 // Handler / HandlerFunc — same as net/http
@@ -764,6 +779,134 @@ func DetectContentType(data []byte) string {
 		}
 	}
 	return "text/plain; charset=utf-8"
+}
+
+// ---------------------------------------------------------------------------
+// ServeFile / FileServer — same as net/http
+// ---------------------------------------------------------------------------
+
+// ServeFile replies to the request with the contents of the named file.
+func ServeFile(w ResponseWriter, r *Request, name string) {
+	f, err := os.Open(name)
+	if err != nil {
+		if os.IsNotExist(err) {
+			NotFound(w, r)
+		} else {
+			Error(w, "500 internal server error", StatusInternalServerError)
+		}
+		return
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		Error(w, "500 internal server error", StatusInternalServerError)
+		return
+	}
+	if info.IsDir() {
+		// Try index.html
+		indexPath := name + "/index.html"
+		if _, err := os.Stat(indexPath); err == nil {
+			ServeFile(w, r, indexPath)
+			return
+		}
+		NotFound(w, r)
+		return
+	}
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		Error(w, "500 internal server error", StatusInternalServerError)
+		return
+	}
+
+	ct := w.Header().Get("Content-Type")
+	if ct == "" {
+		ct = contentTypeByExtension(name)
+		if ct == "" {
+			ct = DetectContentType(data)
+		}
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Content-Length", itoa(len(data)))
+	w.Write(data)
+}
+
+func contentTypeByExtension(name string) string {
+	ext := strings.ToLower(filepath.Ext(name))
+	switch ext {
+	case ".html", ".htm":
+		return "text/html; charset=utf-8"
+	case ".css":
+		return "text/css; charset=utf-8"
+	case ".js", ".mjs":
+		return "application/javascript; charset=utf-8"
+	case ".json":
+		return "application/json; charset=utf-8"
+	case ".xml":
+		return "text/xml; charset=utf-8"
+	case ".txt":
+		return "text/plain; charset=utf-8"
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".svg":
+		return "image/svg+xml"
+	case ".ico":
+		return "image/x-icon"
+	case ".woff":
+		return "font/woff"
+	case ".woff2":
+		return "font/woff2"
+	case ".pdf":
+		return "application/pdf"
+	case ".wasm":
+		return "application/wasm"
+	case ".webp":
+		return "image/webp"
+	case ".mp4":
+		return "video/mp4"
+	case ".webm":
+		return "video/webm"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".ogg":
+		return "audio/ogg"
+	}
+	return ""
+}
+
+// FileServer returns a handler that serves HTTP requests with the contents
+// of the file system rooted at root. Uses the VFS (/tmp or /data).
+func FileServer(root Dir) Handler {
+	return &fileHandler{root: string(root)}
+}
+
+// Dir is a filesystem directory. In GoMode this maps to the WASI VFS.
+type Dir string
+
+// Open implements FileSystem for Dir.
+func (d Dir) Open(name string) (*os.File, error) {
+	fullPath := string(d) + "/" + name
+	return os.Open(fullPath)
+}
+
+type fileHandler struct {
+	root string
+}
+
+func (f *fileHandler) ServeHTTP(w ResponseWriter, r *Request) {
+	path := r.URL.Path
+	if path == "" {
+		path = "/"
+	}
+	// Prevent path traversal
+	clean := filepath.Clean(path)
+	fullPath := f.root + clean
+	ServeFile(w, r, fullPath)
 }
 
 // ---------------------------------------------------------------------------

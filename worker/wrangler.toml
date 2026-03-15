@@ -2,6 +2,16 @@ name = "gomode"
 main = "src/worker.ts"
 compatibility_date = "2024-12-01"
 
+# R2: persistent filesystem storage
+[[r2_buckets]]
+binding = "FS_BUCKET"
+bucket_name = "gomode-fs"
+
+# KV: key-value store
+[[kv_namespaces]]
+binding = "KV"
+id = "gomode-kv"
+
 [durable_objects]
 bindings = [
   { name = "GO_DO", class_name = "GoDO" }
@@ -9,4 +19,4 @@ bindings = [
 
 [[migrations]]
 tag = "v1"
-new_classes = ["GoDO"]
+new_sqlite_classes = ["GoDO"]

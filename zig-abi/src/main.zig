@@ -137,3 +137,40 @@ export fn zig_hmac_sha256(key_ptr: u32, key_len: u32, msg_ptr: u32, msg_len: u32
     const out = @as([*]u8, @ptrFromInt(out_ptr))[0..32];
     crypto.hmacSha256(key, msg, out);
 }
+
+export fn zig_sha512(data_ptr: u32, data_len: u32, out_ptr: u32) void {
+    if (data_ptr == 0 or out_ptr == 0) return;
+    const data = @as([*]const u8, @ptrFromInt(data_ptr))[0..data_len];
+    const out = @as([*]u8, @ptrFromInt(out_ptr))[0..64];
+    crypto.sha512(data, out);
+}
+
+export fn zig_aes256gcm_encrypt(
+    key_ptr: u32, nonce_ptr: u32,
+    pt_ptr: u32, pt_len: u32,
+    aad_ptr: u32, aad_len: u32,
+    out_ptr: u32,
+) u32 {
+    if (key_ptr == 0 or nonce_ptr == 0 or out_ptr == 0) return 1;
+    const key: *const [32]u8 = @ptrCast(@alignCast(@as([*]const u8, @ptrFromInt(key_ptr))));
+    const nonce: *const [12]u8 = @ptrCast(@alignCast(@as([*]const u8, @ptrFromInt(nonce_ptr))));
+    const pt = if (pt_ptr != 0 and pt_len > 0) @as([*]const u8, @ptrFromInt(pt_ptr))[0..pt_len] else &[_]u8{};
+    const aad = if (aad_ptr != 0 and aad_len > 0) @as([*]const u8, @ptrFromInt(aad_ptr))[0..aad_len] else &[_]u8{};
+    const out = @as([*]u8, @ptrFromInt(out_ptr))[0 .. pt_len + 16];
+    return crypto.aes256GcmEncrypt(key, nonce, pt, aad, out);
+}
+
+export fn zig_aes256gcm_decrypt(
+    key_ptr: u32, nonce_ptr: u32,
+    ct_ptr: u32, ct_len: u32,
+    aad_ptr: u32, aad_len: u32,
+    out_ptr: u32,
+) u32 {
+    if (key_ptr == 0 or nonce_ptr == 0 or ct_ptr == 0 or ct_len < 16 or out_ptr == 0) return 1;
+    const key: *const [32]u8 = @ptrCast(@alignCast(@as([*]const u8, @ptrFromInt(key_ptr))));
+    const nonce: *const [12]u8 = @ptrCast(@alignCast(@as([*]const u8, @ptrFromInt(nonce_ptr))));
+    const ct = @as([*]const u8, @ptrFromInt(ct_ptr))[0..ct_len];
+    const aad = if (aad_ptr != 0 and aad_len > 0) @as([*]const u8, @ptrFromInt(aad_ptr))[0..aad_len] else &[_]u8{};
+    const out = @as([*]u8, @ptrFromInt(out_ptr))[0 .. ct_len - 16];
+    return crypto.aes256GcmDecrypt(key, nonce, ct, aad, out);
+}

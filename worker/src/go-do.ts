@@ -9,6 +9,7 @@
  */
 
 import goWasmModule from "./go.wasm";
+import { WasiFs, buildWasiImports, initSchema, preloadFromR2, flushToR2 } from "./wasi";
 
 const textDecoder = new TextDecoder();
 const textEncoder = new TextEncoder();
@@ -32,6 +33,8 @@ const METHOD_BYTES: Record<string, Uint8Array> = {
 const REQ_SCRATCH_SIZE = 10 * VALUE_SLOT + 8192;
 
 interface Env {
+  FS_BUCKET?: R2Bucket;
+  KV?: KVNamespace;
   [key: string]: unknown;
 }
 
@@ -132,15 +135,28 @@ export class GoDO implements DurableObject {
   private wasmExports: GoWasmExports | null = null;
   private initPromise: Promise<void> | null = null;
   private reqScratch = 0;
+  private wasiFs: WasiFs;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
+    this.wasiFs = new WasiFs();
   }
 
   private async initWasm(): Promise<void> {
+    // Initialize SQLite schema and pre-load files from R2
+    if (this.env.FS_BUCKET) {
+      const sql = this.state.storage.sql;
+      initSchema(sql);
+      await preloadFromR2(this.wasiFs, this.env.FS_BUCKET, this.state.id.toString(), sql);
+    }
+
     const instance = await WebAssembly.instantiate(goWasmModule, {
-      wasi_snapshot_preview1: this.buildWasiImports(),
+      wasi_snapshot_preview1: buildWasiImports(
+        () => this.wasmExports!.memory,
+        this.wasiFs,
+        "do"
+      ),
     });
 
     this.wasmExports = instance.exports as unknown as GoWasmExports;
@@ -235,9 +251,14 @@ export class GoDO implements DurableObject {
         fetchInit.body = fetchBodyStr;
       }
 
-      const fetchResp = await fetch(fetchUrl, fetchInit).catch((err) =>
-        new Response(String(err), { status: 502, headers: { "content-type": "text/plain" } })
-      );
+      let fetchResp: Response;
+      if (fetchMethod.startsWith("__")) {
+        fetchResp = await handleBindingOp(fetchMethod, fetchUrl, fetchBodyStr, this.env);
+      } else {
+        fetchResp = await fetch(fetchUrl, fetchInit).catch((err) =>
+          new Response(String(err), { status: 502, headers: { "content-type": "text/plain" } })
+        );
+      }
       const fetchBody = await fetchResp.text();
       const fetchCt = fetchResp.headers.get("content-type") || "";
 
@@ -264,6 +285,11 @@ export class GoDO implements DurableObject {
         });
       }
       raw = readRawResponse(exports, respPtr);
+    }
+
+    // Flush dirty files to R2 after handler completes
+    if (this.env.FS_BUCKET && this.wasiFs.dirty.size > 0 || this.wasiFs.deleted.size > 0) {
+      await flushToR2(this.wasiFs, this.env.FS_BUCKET!, this.state.id.toString(), this.state.storage.sql);
     }
 
     const nullBodyStatus = raw.status === 101 || raw.status === 204 || raw.status === 205 || raw.status === 304;
@@ -380,77 +406,41 @@ export class GoDO implements DurableObject {
     return this.reqScratch;
   }
 
-  private buildWasiImports(): Record<string, WebAssembly.ImportValue> {
-    const getMemory = () => this.wasmExports!.memory;
+  // WASI imports are now provided by the shared wasi.ts module
+}
 
-    return {
-      fd_write: (fd: number, iovs: number, iovsLen: number, nwritten: number) => {
-        const memory = getMemory();
-        const mem = new DataView(memory.buffer);
-        let written = 0;
-        for (let i = 0; i < iovsLen; i++) {
-          const ptr = mem.getUint32(iovs + i * 8, true);
-          const len = mem.getUint32(iovs + i * 8 + 4, true);
-          if (fd === 2) {
-            console.log("[gomode:do:stderr]", textDecoder.decode(new Uint8Array(memory.buffer, ptr, len)));
-          }
-          written += len;
-        }
-        mem.setUint32(nwritten, written, true);
-        return 0;
-      },
-      fd_read: (_fd: number, _iovs: number, _iovsLen: number, nread: number) => {
-        new DataView(getMemory().buffer).setUint32(nread, 0, true);
-        return 0;
-      },
-      fd_close: () => 0,
-      fd_seek: () => 0,
-      fd_fdstat_get: (fd: number, buf: number) => {
-        const mem = new DataView(getMemory().buffer);
-        mem.setUint8(buf, fd <= 2 ? 2 : 4);
-        mem.setUint8(buf + 1, 0);
-        mem.setBigUint64(buf + 8, 0n, true);
-        mem.setBigUint64(buf + 16, 0n, true);
-        return 0;
-      },
-      fd_fdstat_set_flags: () => 0,
-      fd_prestat_get: () => 8,
-      fd_prestat_dir_name: () => 8,
-      environ_get: () => 0,
-      environ_sizes_get: (count: number, size: number) => {
-        const mem = new DataView(getMemory().buffer);
-        mem.setUint32(count, 0, true);
-        mem.setUint32(size, 0, true);
-        return 0;
-      },
-      args_get: () => 0,
-      args_sizes_get: (argc: number, argvBufSize: number) => {
-        const mem = new DataView(getMemory().buffer);
-        mem.setUint32(argc, 0, true);
-        mem.setUint32(argvBufSize, 0, true);
-        return 0;
-      },
-      clock_time_get: (_id: number, _precision: bigint, out: number) => {
-        new DataView(getMemory().buffer).setBigUint64(out, BigInt(Date.now()) * 1_000_000n, true);
-        return 0;
-      },
-      proc_exit: (code: number) => { throw new Error(`exit code: ${code}`); },
-      random_get: (ptr: number, len: number) => {
-        crypto.getRandomValues(new Uint8Array(getMemory().buffer, ptr, len));
-        return 0;
-      },
-      path_open: () => 44,
-      path_filestat_get: () => 44,
-      path_create_directory: () => 44,
-      path_remove_directory: () => 44,
-      path_unlink_file: () => 44,
-      path_rename: () => 44,
-      fd_readdir: () => 44,
-      poll_oneoff: (_in: number, _out: number, _nsubs: number, nevents: number) => {
-        new DataView(getMemory().buffer).setUint32(nevents, 0, true);
-        return 0;
-      },
-      sched_yield: () => 0,
-    };
+async function handleBindingOp(method: string, key: string, body: string, env: Env): Promise<Response> {
+  try {
+    switch (method) {
+      case "__KV_GET": {
+        if (!env.KV) return new Response("KV binding not configured", { status: 500 });
+        const value = await env.KV.get(key);
+        if (value === null) return new Response("", { status: 404 });
+        return new Response(value, { status: 200 });
+      }
+      case "__KV_PUT": {
+        if (!env.KV) return new Response("KV binding not configured", { status: 500 });
+        await env.KV.put(key, body);
+        return new Response("ok", { status: 200 });
+      }
+      case "__KV_DELETE": {
+        if (!env.KV) return new Response("KV binding not configured", { status: 500 });
+        await env.KV.delete(key);
+        return new Response("ok", { status: 200 });
+      }
+      case "__KV_LIST": {
+        if (!env.KV) return new Response("KV binding not configured", { status: 500 });
+        const list = await env.KV.list({ prefix: key || undefined });
+        const keys = list.keys.map((k: { name: string }) => k.name);
+        return new Response(JSON.stringify(keys), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      default:
+        return new Response(`unknown binding op: ${method}`, { status: 400 });
+    }
+  } catch (err) {
+    return new Response(String(err), { status: 500 });
   }
 }

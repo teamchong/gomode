@@ -36,7 +36,9 @@ describe("Columnar SIMD analytics", () => {
     });
     const data = await res.json();
     // a and b are perfectly correlated (b = 2a)
-    expect(data.correlations.a_b).toBeCloseTo(1.0, 5);
+    // Go map iteration is non-deterministic, so key could be a_b or b_a
+    const corr = data.correlations.a_b ?? data.correlations.b_a;
+    expect(corr).toBeCloseTo(1.0, 5);
   });
 
   it("handles single-column dataset (no correlations)", async () => {
@@ -306,6 +308,27 @@ describe("net/http conformance", () => {
 
   // ---- SIMD ----
 
+  describe("Zig SHA-512", () => {
+    it("computes correct SHA-512 hash", async () => {
+      const resp = await fetch(`${BASE}/sha512?input=test`);
+      const data = await resp.json();
+      expect(data.sha512).toBe(
+        "ee26b0dd4af7e749aa1a8ee3c10ae9923f618980772e473f8819a5d4940e0db27ac185f8a0e1d5f84f88bc887fd67b143732c304cc5fa9ad8e6f57f50028a8ff"
+      );
+    });
+  });
+
+  describe("Zig AES-256-GCM", () => {
+    it("encrypts and decrypts round-trip", async () => {
+      const resp = await fetch(`${BASE}/aes?text=secret+data`);
+      const data = await resp.json();
+      expect(data.round_trip_ok).toBe(true);
+      expect(data.decrypted).toBe("secret data");
+      expect(data.ciphertext_len).toBe(11 + 16); // plaintext + 16-byte tag
+      expect(data.tag_size).toBe(16);
+    });
+  });
+
   describe("Zig SIMD operations", () => {
     it("computes correct sum, dot product, scale, minmax", async () => {
       const resp = await fetch(`${BASE}/simd`);
@@ -316,5 +339,178 @@ describe("net/http conformance", () => {
       expect(data.min).toBe(2);
       expect(data.max).toBe(16);
     });
+  });
+});
+
+describe("KV bindings (gomode.KV*)", () => {
+  it("KVPut + KVGet round-trip", async () => {
+    const putRes = await fetch(`${BASE}/kv/put?key=test-rt&value=round-trip`);
+    expect(putRes.status).toBe(200);
+
+    const getRes = await fetch(`${BASE}/kv/get?key=test-rt`);
+    expect(getRes.status).toBe(200);
+    const data = await getRes.json();
+    expect(data.found).toBe(true);
+    expect(data.value).toBe("round-trip");
+  });
+
+  it("KVGet returns found=false for missing keys", async () => {
+    const res = await fetch(`${BASE}/kv/get?key=nonexistent-key-xyz`);
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.found).toBe(false);
+    expect(data.value).toBe("");
+  });
+
+  it("KVDelete removes a key", async () => {
+    await fetch(`${BASE}/kv/put?key=to-delete&value=bye`);
+    const delRes = await fetch(`${BASE}/kv/delete?key=to-delete`);
+    expect(delRes.status).toBe(200);
+
+    const getRes = await fetch(`${BASE}/kv/get?key=to-delete`);
+    const data = await getRes.json();
+    expect(data.found).toBe(false);
+  });
+
+  it("KVList returns keys with prefix", async () => {
+    await fetch(`${BASE}/kv/put?key=list-a&value=1`);
+    await fetch(`${BASE}/kv/put?key=list-b&value=2`);
+
+    const res = await fetch(`${BASE}/kv/list?prefix=list-`);
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.keys).toContain("list-a");
+    expect(data.keys).toContain("list-b");
+  });
+});
+
+describe("SSE / http.Flusher", () => {
+  it("serves server-sent events with correct content-type", async () => {
+    const resp = await fetch(`${BASE}/sse`);
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("content-type")).toBe("text/event-stream");
+    expect(resp.headers.get("cache-control")).toBe("no-cache");
+    const body = await resp.text();
+    expect(body).toContain("event: message");
+    expect(body).toContain('data: {"count":0}');
+    expect(body).toContain('data: {"count":1}');
+    expect(body).toContain('data: {"count":2}');
+    expect(body).toContain("event: done");
+    expect(body).toContain('data: {"total":3}');
+  });
+});
+
+describe("http.ServeFile / FileServer", () => {
+  it("ServeFile serves a file with correct content-type", async () => {
+    // Write a file first
+    await fetch(`${BASE}/fs/write?path=/tmp/serve-test.html&content=%3Cp%3Ehi%3C/p%3E`);
+    const resp = await fetch(`${BASE}/serve/serve-test.html`);
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("content-type")).toContain("text/html");
+    expect(await resp.text()).toBe("<p>hi</p>");
+  });
+
+  it("ServeFile returns 404 for missing files", async () => {
+    const resp = await fetch(`${BASE}/serve/does-not-exist.txt`);
+    expect(resp.status).toBe(404);
+  });
+
+  it("ServeFile detects CSS content type", async () => {
+    await fetch(`${BASE}/fs/write?path=/tmp/test.css&content=body%7B%7D`);
+    const resp = await fetch(`${BASE}/serve/test.css`);
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("content-type")).toContain("text/css");
+  });
+
+  it("FileServer serves files via http.StripPrefix", async () => {
+    await fetch(`${BASE}/fs/write?path=/tmp/fileserver.json&content=%7B%22ok%22:true%7D`);
+    const resp = await fetch(`${BASE}/files/fileserver.json`);
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("content-type")).toContain("application/json");
+    const data = await resp.json();
+    expect(data.ok).toBe(true);
+  });
+});
+
+describe("WASI filesystem (os.* operations)", () => {
+  it("os.WriteFile + os.ReadFile round-trip", async () => {
+    // Write
+    const writeRes = await fetch(`${BASE}/fs/write?path=/tmp/hello.txt&content=hello+wasi`);
+    expect(writeRes.status).toBe(200);
+    const writeData = await writeRes.json();
+    expect(writeData.status).toBe("written");
+    expect(writeData.size).toBe("10");
+
+    // Read back
+    const readRes = await fetch(`${BASE}/fs/read?path=/tmp/hello.txt`);
+    expect(readRes.status).toBe(200);
+    const readData = await readRes.json();
+    expect(readData.content).toBe("hello wasi");
+    expect(readData.size).toBe("10");
+  });
+
+  it("os.Stat returns file metadata", async () => {
+    await fetch(`${BASE}/fs/write?path=/tmp/stat-test.txt&content=abc`);
+    const res = await fetch(`${BASE}/fs/stat?path=/tmp/stat-test.txt`);
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.name).toBe("stat-test.txt");
+    expect(data.size).toBe(3);
+    expect(data.isDir).toBe(false);
+  });
+
+  it("os.Stat returns directory metadata", async () => {
+    const res = await fetch(`${BASE}/fs/stat?path=/tmp`);
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.isDir).toBe(true);
+  });
+
+  it("os.MkdirAll creates nested directories", async () => {
+    const res = await fetch(`${BASE}/fs/mkdir?path=/tmp/a/b/c`);
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.status).toBe("created");
+
+    // Verify directory exists
+    const statRes = await fetch(`${BASE}/fs/stat?path=/tmp/a/b/c`);
+    expect(statRes.status).toBe(200);
+    const stat = await statRes.json();
+    expect(stat.isDir).toBe(true);
+  });
+
+  it("os.ReadDir lists directory contents", async () => {
+    await fetch(`${BASE}/fs/mkdir?path=/tmp/listdir`);
+    await fetch(`${BASE}/fs/write?path=/tmp/listdir/file1.txt&content=one`);
+    await fetch(`${BASE}/fs/write?path=/tmp/listdir/file2.txt&content=two`);
+    await fetch(`${BASE}/fs/mkdir?path=/tmp/listdir/sub`);
+
+    const res = await fetch(`${BASE}/fs/readdir?path=/tmp/listdir`);
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.entries).toContain("file1.txt");
+    expect(data.entries).toContain("file2.txt");
+    expect(data.entries).toContain("sub/");
+  });
+
+  it("os.Remove deletes a file", async () => {
+    await fetch(`${BASE}/fs/write?path=/tmp/delete-me.txt&content=bye`);
+
+    // Verify it exists
+    const statRes = await fetch(`${BASE}/fs/stat?path=/tmp/delete-me.txt`);
+    expect(statRes.status).toBe(200);
+
+    // Delete it
+    const delRes = await fetch(`${BASE}/fs/remove?path=/tmp/delete-me.txt`);
+    expect(delRes.status).toBe(200);
+
+    // Verify it's gone
+    const readRes = await fetch(`${BASE}/fs/read?path=/tmp/delete-me.txt`);
+    expect(readRes.status).toBe(500);
+  });
+
+  it("reading non-existent file returns error", async () => {
+    const res = await fetch(`${BASE}/fs/read?path=/tmp/does-not-exist.txt`);
+    expect(res.status).toBe(500);
   });
 });

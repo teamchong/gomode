@@ -145,6 +145,25 @@ describe("Durable Object — WebSocket", () => {
   }, 10000);
 });
 
+describe("Durable Object — KV bindings", () => {
+  it("PUT and GET through DO multi-fetch", async () => {
+    const put = await fetch(`${BASE}/kv/put?key=do-kv-test&value=do-value`);
+    expect(put.status).toBe(200);
+    const putData = await put.json();
+    expect(putData.status).toBe("ok");
+
+    const get = await fetch(`${BASE}/kv/get?key=do-kv-test`);
+    expect(get.status).toBe(200);
+    const getData = await get.json();
+    expect(getData.found).toBe(true);
+    expect(getData.value).toBe("do-value");
+
+    // Cleanup
+    const del = await fetch(`${BASE}/kv/delete?key=do-kv-test`);
+    expect(del.status).toBe(200);
+  });
+});
+
 describe("Durable Object — state persistence across requests", () => {
   it("WASM instance persists (same DO handles multiple requests)", async () => {
     // Make two requests — both should succeed, proving the DO instance stays alive

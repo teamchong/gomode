@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"gomode"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -443,6 +444,54 @@ func main() {
 		})
 	})
 
+	// SHA-512 via Zig crypto
+	http.HandleFunc("/sha512", func(w http.ResponseWriter, r *http.Request) {
+		input := r.FormValue("input")
+		if input == "" {
+			input = "hello"
+		}
+		hash := gomode.SHA512Hex([]byte(input))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"input":  input,
+			"sha512": hash,
+		})
+	})
+
+	// AES-256-GCM encrypt + decrypt round-trip
+	http.HandleFunc("/aes", func(w http.ResponseWriter, r *http.Request) {
+		plaintext := r.FormValue("text")
+		if plaintext == "" {
+			plaintext = "secret message"
+		}
+		// Use a fixed key and nonce for deterministic testing
+		var key [32]byte
+		copy(key[:], []byte("01234567890123456789012345678901"))
+		var nonce [12]byte
+		copy(nonce[:], []byte("012345678901"))
+
+		ciphertext, err := gomode.Aes256GcmEncrypt(key, nonce, []byte(plaintext), nil)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		decrypted, err := gomode.Aes256GcmDecrypt(key, nonce, ciphertext, nil)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"plaintext":       plaintext,
+			"ciphertext_len":  len(ciphertext),
+			"decrypted":       string(decrypted),
+			"round_trip_ok":   string(decrypted) == plaintext,
+			"tag_size":        16,
+		})
+	})
+
 	// WebSocket echo — DO mode only (method = "WEBSOCKET" for messages)
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "WEBSOCKET" {
@@ -489,6 +538,227 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":         resp.StatusCode,
 			"content_length": resp.ContentLength,
+		})
+	})
+
+	// KV operations via gomode.KV* bindings
+	http.HandleFunc("/kv/get", func(w http.ResponseWriter, r *http.Request) {
+		key := r.FormValue("key")
+		if key == "" {
+			http.Error(w, "key required", 400)
+			return
+		}
+		value, found, err := gomode.KVGet(key)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"key":   key,
+			"value": value,
+			"found": found,
+		})
+	})
+
+	http.HandleFunc("/kv/put", func(w http.ResponseWriter, r *http.Request) {
+		key := r.FormValue("key")
+		value := r.FormValue("value")
+		if key == "" {
+			http.Error(w, "key required", 400)
+			return
+		}
+		err := gomode.KVPut(key, value)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "ok",
+			"key":    key,
+		})
+	})
+
+	http.HandleFunc("/kv/delete", func(w http.ResponseWriter, r *http.Request) {
+		key := r.FormValue("key")
+		if key == "" {
+			http.Error(w, "key required", 400)
+			return
+		}
+		err := gomode.KVDelete(key)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "deleted",
+			"key":    key,
+		})
+	})
+
+	http.HandleFunc("/kv/list", func(w http.ResponseWriter, r *http.Request) {
+		prefix := r.FormValue("prefix")
+		keys, err := gomode.KVList(prefix)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"prefix": prefix,
+			"keys":   keys,
+		})
+	})
+
+	// SSE endpoint — server-sent events via http.Flusher
+	http.HandleFunc("/sse", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming not supported", 500)
+			return
+		}
+
+		for i := 0; i < 3; i++ {
+			fmt.Fprintf(w, "event: message\ndata: {\"count\":%d}\n\n", i)
+			flusher.Flush()
+		}
+		fmt.Fprintf(w, "event: done\ndata: {\"total\":3}\n\n")
+		flusher.Flush()
+	})
+
+	// ServeFile — serves files from the VFS using standard http.ServeFile
+	http.HandleFunc("/serve/", func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/serve")
+		if path == "" || path == "/" {
+			path = "/index.html"
+		}
+		http.ServeFile(w, r, "/tmp"+path)
+	})
+
+	// FileServer — serves a directory tree
+	http.Handle("/files/", http.StripPrefix("/files", http.FileServer(http.Dir("/tmp"))))
+
+	// Filesystem operations — os.Create, os.ReadFile, os.Stat, os.MkdirAll, os.ReadDir
+	http.HandleFunc("/fs/write", func(w http.ResponseWriter, r *http.Request) {
+		path := r.FormValue("path")
+		content := r.FormValue("content")
+		if path == "" {
+			path = "/tmp/test.txt"
+		}
+		if content == "" {
+			content = "hello from gomode"
+		}
+		err := os.WriteFile(path, []byte(content), 0644)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "written",
+			"path":   path,
+			"size":   strconv.Itoa(len(content)),
+		})
+	})
+
+	http.HandleFunc("/fs/read", func(w http.ResponseWriter, r *http.Request) {
+		path := r.FormValue("path")
+		if path == "" {
+			path = "/tmp/test.txt"
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"path":    path,
+			"content": string(data),
+			"size":    strconv.Itoa(len(data)),
+		})
+	})
+
+	http.HandleFunc("/fs/stat", func(w http.ResponseWriter, r *http.Request) {
+		path := r.FormValue("path")
+		if path == "" {
+			path = "/tmp"
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"name":  info.Name(),
+			"size":  info.Size(),
+			"isDir": info.IsDir(),
+		})
+	})
+
+	http.HandleFunc("/fs/mkdir", func(w http.ResponseWriter, r *http.Request) {
+		path := r.FormValue("path")
+		if path == "" {
+			path = "/tmp/subdir"
+		}
+		err := os.MkdirAll(path, 0755)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "created",
+			"path":   path,
+		})
+	})
+
+	http.HandleFunc("/fs/readdir", func(w http.ResponseWriter, r *http.Request) {
+		path := r.FormValue("path")
+		if path == "" {
+			path = "/tmp"
+		}
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+			if e.IsDir() {
+				names[i] += "/"
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"path":    path,
+			"entries": names,
+		})
+	})
+
+	http.HandleFunc("/fs/remove", func(w http.ResponseWriter, r *http.Request) {
+		path := r.FormValue("path")
+		if path == "" {
+			http.Error(w, "path required", 400)
+			return
+		}
+		err := os.Remove(path)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "removed",
+			"path":   path,
 		})
 	})
 

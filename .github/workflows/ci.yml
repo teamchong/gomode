@@ -41,8 +41,17 @@ jobs:
       - name: Build Go + Zig WASM
         run: npm run build:go
 
-      - name: Start dev server and run tests
+      - name: Start dev server
         run: |
-          (cd worker && npx wrangler dev --port 8787) &
-          sleep 5
-          npm test
+          cd worker && npx wrangler dev --port 8787 &
+          # Wait for server to be ready
+          for i in $(seq 1 30); do
+            if curl -s http://localhost:8787/ > /dev/null 2>&1; then
+              echo "Server ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Run tests
+        run: npm test

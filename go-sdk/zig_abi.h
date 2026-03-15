@@ -36,5 +36,8 @@ void zig_simd_map_linear_f64(uint32_t ptr, uint32_t count, double a, double b);
 
 // Crypto operations
 void zig_hmac_sha256(uint32_t key_ptr, uint32_t key_len, uint32_t msg_ptr, uint32_t msg_len, uint32_t out_ptr);
+void zig_sha512(uint32_t data_ptr, uint32_t data_len, uint32_t out_ptr);
+uint32_t zig_aes256gcm_encrypt(uint32_t key_ptr, uint32_t nonce_ptr, uint32_t pt_ptr, uint32_t pt_len, uint32_t aad_ptr, uint32_t aad_len, uint32_t out_ptr);
+uint32_t zig_aes256gcm_decrypt(uint32_t key_ptr, uint32_t nonce_ptr, uint32_t ct_ptr, uint32_t ct_len, uint32_t aad_ptr, uint32_t aad_len, uint32_t out_ptr);
 
 #endif
