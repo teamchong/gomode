@@ -918,10 +918,15 @@ func HandleRequest(reqBase uint32) uint32 {
 	}
 
 	// If the handler triggered a fetch, return status=-1 so JS does the fetch and replays.
-	// Headers field carries the pending call index for the round-trip.
+	// Body field: URL + "\n" + fetchBody (URL can't contain newlines)
+	// Content-type field: method + "\n" + fetchContentType
+	// Headers field: call index
 	if fetchPending {
 		fetchPending = false
-		return writeZerobufResponse(-1, fetchMethod, fetchURL, itoa(fetchPendingIndex))
+		return writeZerobufResponse(-1,
+			fetchMethod+"\n"+fetchContentType,
+			fetchURL+"\n"+fetchBody,
+			itoa(fetchPendingIndex))
 	}
 
 	// All fetches resolved — clear cache for next request

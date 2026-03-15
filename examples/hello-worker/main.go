@@ -424,6 +424,24 @@ func main() {
 		})
 	})
 
+	// POST fetch — outbound http.Post with body forwarding
+	http.HandleFunc("/post-fetch", func(w http.ResponseWriter, r *http.Request) {
+		url := r.FormValue("url")
+		if url == "" {
+			url = "https://httpbin.org/post"
+		}
+		resp, err := http.Post(url, "application/json", strings.NewReader(`{"from":"gomode"}`))
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":         resp.StatusCode,
+			"content_length": resp.ContentLength,
+		})
+	})
+
 	// Large response — proves dynamic buffer works beyond old 16KB limit
 	http.HandleFunc("/large", func(w http.ResponseWriter, r *http.Request) {
 		sizeStr := r.FormValue("size")

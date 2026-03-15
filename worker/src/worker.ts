@@ -334,7 +334,10 @@ function readRawResponse(exports: GoWasmExports, respPtr: number): WasmResponse 
 
   let rawHeaders = "";
   const respHeaders = new Headers();
-  respHeaders.set("content-type", contentType);
+  // Don't set content-type for status=-1 (fetch protocol uses it for method+content-type)
+  if (status >= 0) {
+    respHeaders.set("content-type", contentType);
+  }
   const hdrsTag = mem.getUint8(respPtr + 3 * VALUE_SLOT);
   if (hdrsTag === TAG_STRING) {
     const hdrsDataPtr = mem.getUint32(respPtr + 3 * VALUE_SLOT + 4, true);
@@ -406,12 +409,29 @@ async function handleWithFanout(
   // Headers field = pending call index (for caching by call order).
   // Loop until all fetches are resolved and handler completes normally.
   while (raw.status === -1) {
-    const fetchUrl = textDecoder.decode(raw.bodyBytes).trim();
-    const fetchMethod = raw.contentType.trim() || "GET";
+    // Body field: "URL\nfetchBody", Content-type field: "method\nfetchContentType"
+    const bodyField = textDecoder.decode(raw.bodyBytes);
+    const nlIdx = bodyField.indexOf("\n");
+    const fetchUrl = (nlIdx >= 0 ? bodyField.slice(0, nlIdx) : bodyField).trim();
+    const fetchBodyStr = nlIdx >= 0 ? bodyField.slice(nlIdx + 1) : "";
+
+    const ctField = raw.contentType;
+    const ctNlIdx = ctField.indexOf("\n");
+    const fetchMethod = (ctNlIdx >= 0 ? ctField.slice(0, ctNlIdx) : ctField).trim() || "GET";
+    const fetchContentType = ctNlIdx >= 0 ? ctField.slice(ctNlIdx + 1) : "";
+
     // Read call index from raw headers field (status=-1 responses use it for the index)
     const callIndex = parseInt(raw.rawHeaders || "0", 10);
 
-    const fetchResp = await fetch(fetchUrl, { method: fetchMethod }).catch((err) =>
+    const fetchInit: RequestInit = { method: fetchMethod };
+    if (fetchBodyStr && fetchMethod !== "GET" && fetchMethod !== "HEAD") {
+      fetchInit.body = fetchBodyStr;
+      if (fetchContentType) {
+        fetchInit.headers = { "Content-Type": fetchContentType };
+      }
+    }
+
+    const fetchResp = await fetch(fetchUrl, fetchInit).catch((err) =>
       new Response(String(err), { status: 502, headers: { "content-type": "text/plain" } })
     );
     const fetchBody = await fetchResp.text();

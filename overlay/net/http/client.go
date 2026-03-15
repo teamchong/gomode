@@ -39,6 +39,8 @@ var DefaultClient = &Client{}
 
 var fetchURL string
 var fetchMethod string
+var fetchBody string
+var fetchContentType string
 var fetchPending bool
 var fetchCallIndex int
 var fetchPendingIndex int
@@ -62,6 +64,8 @@ func doFetch(method, rawurl, body, contentType string) (*Response, error) {
 	fetchPendingIndex = idx
 	fetchURL = rawurl
 	fetchMethod = method
+	fetchBody = body
+	fetchContentType = contentType
 	fetchPending = true
 	return nil, errFetchPending
 }

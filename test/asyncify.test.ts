@@ -67,3 +67,13 @@ describe("multi-fetch (multiple http.Get in one handler)", () => {
     expect(data.fetch2_status).toBe(200);
   }, 10000);
 });
+
+describe("outbound http.Post (body forwarding)", () => {
+  it("sends POST with JSON body to external API", async () => {
+    const resp = await fetch(`${BASE}/post-fetch?url=${encodeURIComponent("https://httpbin.org/post")}`);
+    expect(resp.status).toBe(200);
+    const data = await resp.json();
+    expect(data.status).toBe(200);
+    expect(data.content_length).toBeGreaterThan(0);
+  }, 10000);
+});
