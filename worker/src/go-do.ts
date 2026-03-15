@@ -171,6 +171,11 @@ export class GoDO implements DurableObject {
     const pathStart = schemeEnd === -1 ? 0 : url.indexOf("/", schemeEnd + 2);
     const pathAndQuery = pathStart === -1 ? "/" : url.slice(pathStart);
 
+    // WebSocket upgrade
+    if (request.headers.get("upgrade") === "websocket") {
+      return this.handleWebSocket(exports, pathAndQuery, request.headers);
+    }
+
     // Read request body
     let body: string | null = null;
     if (request.method === "POST" || request.method === "PUT" || request.method === "PATCH") {
@@ -248,6 +253,49 @@ export class GoDO implements DurableObject {
 
     const nullBodyStatus = raw.status === 101 || raw.status === 204 || raw.status === 205 || raw.status === 304;
     return new Response(nullBodyStatus ? null : raw.bodyBytes, { status: raw.status, headers: raw.headers });
+  }
+
+  private handleWebSocket(
+    exports: GoWasmExports,
+    pathAndQuery: string,
+    headers: Headers
+  ): Response {
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    server.accept();
+
+    server.addEventListener("message", (event: MessageEvent) => {
+      const msg = typeof event.data === "string" ? event.data : new TextDecoder().decode(event.data as ArrayBuffer);
+      const reqPtr = this.buildRequest(exports, "WEBSOCKET", pathAndQuery, msg, headers);
+      try {
+        const respPtr = exports.handle_zerobuf(reqPtr);
+        const raw = readRawResponse(exports, respPtr);
+        // If handler writes a response body, send it back as WS message
+        if (raw.bodyBytes.byteLength > 0) {
+          server.send(textDecoder.decode(raw.bodyBytes));
+        }
+        // Check for close signal
+        if (raw.headers.get("x-ws-close") === "true") {
+          server.close(1000, "closed by handler");
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        server.send(`error: ${msg}`);
+        server.close(1011, "handler panic");
+      }
+    });
+
+    server.addEventListener("close", () => {
+      // Notify Go handler of disconnect
+      const reqPtr = this.buildRequest(exports, "WEBSOCKET_CLOSE", pathAndQuery, null, headers);
+      try {
+        exports.handle_zerobuf(reqPtr);
+      } catch (_) {
+        // Ignore errors on close
+      }
+    });
+
+    return new Response(null, { status: 101, webSocket: client });
   }
 
   private buildRequest(

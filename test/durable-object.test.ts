@@ -113,6 +113,38 @@ describe("Durable Object — outbound fetch", () => {
   }, 10000);
 });
 
+describe("Durable Object — WebSocket", () => {
+  it("echoes messages via WebSocket", async () => {
+    const ws = new WebSocket("ws://localhost:8787/do/ws");
+    const messages: string[] = [];
+
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("WebSocket timeout")), 5000);
+      ws.addEventListener("open", () => {
+        ws.send("hello");
+      });
+      ws.addEventListener("message", (event) => {
+        messages.push(String(event.data));
+        if (messages.length === 1) {
+          ws.send("world");
+        }
+        if (messages.length === 2) {
+          clearTimeout(timeout);
+          ws.close();
+          resolve();
+        }
+      });
+      ws.addEventListener("error", (e) => {
+        clearTimeout(timeout);
+        reject(e);
+      });
+    });
+
+    expect(messages[0]).toBe("echo: hello");
+    expect(messages[1]).toBe("echo: world");
+  }, 10000);
+});
+
 describe("Durable Object — state persistence across requests", () => {
   it("WASM instance persists (same DO handles multiple requests)", async () => {
     // Make two requests — both should succeed, proving the DO instance stays alive

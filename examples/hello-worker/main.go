@@ -424,6 +424,32 @@ func main() {
 		})
 	})
 
+	// WebSocket echo — DO mode only (method = "WEBSOCKET" for messages)
+	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "WEBSOCKET" {
+			// Echo the message back with prefix
+			msg := r.FormValue("msg")
+			if msg == "" {
+				// Read body directly for WS messages
+				buf := make([]byte, 4096)
+				n, _ := r.Body.Read(buf)
+				msg = string(buf[:n])
+			}
+			fmt.Fprintf(w, "echo: %s", msg)
+			return
+		}
+		if r.Method == "WEBSOCKET_CLOSE" {
+			// Connection closed — cleanup if needed
+			return
+		}
+		// Regular HTTP request to /ws — return info
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"type": "websocket_endpoint",
+			"hint": "connect via ws://host/do/ws",
+		})
+	})
+
 	// Panic recovery test — handler panics, should get 500 response
 	http.HandleFunc("/panic", func(w http.ResponseWriter, r *http.Request) {
 		panic("test panic from handler")
