@@ -210,14 +210,29 @@ export class GoDO implements DurableObject {
       const fetchMethod = (ctNlIdx >= 0 ? ctField.slice(0, ctNlIdx) : ctField).trim() || "GET";
       const fetchContentType = ctNlIdx >= 0 ? ctField.slice(ctNlIdx + 1) : "";
 
-      const callIndex = parseInt(raw.rawHeaders || "0", 10);
+      const hdrsField = raw.rawHeaders || "0";
+      const hdrsNlIdx = hdrsField.indexOf("\n");
+      const callIndex = parseInt(hdrsNlIdx >= 0 ? hdrsField.slice(0, hdrsNlIdx) : hdrsField, 10);
+      const customHdrs = hdrsNlIdx >= 0 ? hdrsField.slice(hdrsNlIdx + 1) : "";
 
       const fetchInit: RequestInit = { method: fetchMethod };
+      const fetchHdrs: Record<string, string> = {};
+      if (fetchContentType) {
+        fetchHdrs["Content-Type"] = fetchContentType;
+      }
+      if (customHdrs) {
+        for (const line of customHdrs.split("\n")) {
+          const ci = line.indexOf(": ");
+          if (ci > 0) {
+            fetchHdrs[line.slice(0, ci)] = line.slice(ci + 2);
+          }
+        }
+      }
+      if (Object.keys(fetchHdrs).length > 0) {
+        fetchInit.headers = fetchHdrs;
+      }
       if (fetchBodyStr && fetchMethod !== "GET" && fetchMethod !== "HEAD") {
         fetchInit.body = fetchBodyStr;
-        if (fetchContentType) {
-          fetchInit.headers = { "Content-Type": fetchContentType };
-        }
       }
 
       const fetchResp = await fetch(fetchUrl, fetchInit).catch((err) =>
@@ -252,7 +267,23 @@ export class GoDO implements DurableObject {
     }
 
     const nullBodyStatus = raw.status === 101 || raw.status === 204 || raw.status === 205 || raw.status === 304;
-    return new Response(nullBodyStatus ? null : raw.bodyBytes, { status: raw.status, headers: raw.headers });
+    if (nullBodyStatus) {
+      return new Response(null, { status: raw.status, headers: raw.headers });
+    }
+    // Stream large bodies in chunks to reduce peak memory
+    if (raw.bodyBytes.byteLength > 65536) {
+      const bytes = raw.bodyBytes;
+      const stream = new ReadableStream({
+        start(controller) {
+          for (let i = 0; i < bytes.byteLength; i += 16384) {
+            controller.enqueue(bytes.subarray(i, Math.min(i + 16384, bytes.byteLength)));
+          }
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: raw.status, headers: raw.headers });
+    }
+    return new Response(raw.bodyBytes, { status: raw.status, headers: raw.headers });
   }
 
   private handleWebSocket(
@@ -265,14 +296,21 @@ export class GoDO implements DurableObject {
     server.accept();
 
     server.addEventListener("message", (event: MessageEvent) => {
-      const msg = typeof event.data === "string" ? event.data : new TextDecoder().decode(event.data as ArrayBuffer);
-      const reqPtr = this.buildRequest(exports, "WEBSOCKET", pathAndQuery, msg, headers);
+      const isBinary = typeof event.data !== "string";
+      const msg = isBinary ? new TextDecoder().decode(event.data as ArrayBuffer) : event.data;
+      const method = isBinary ? "WEBSOCKET_BINARY" : "WEBSOCKET";
+      const reqPtr = this.buildRequest(exports, method, pathAndQuery, msg, headers);
       try {
         const respPtr = exports.handle_zerobuf(reqPtr);
         const raw = readRawResponse(exports, respPtr);
         // If handler writes a response body, send it back as WS message
         if (raw.bodyBytes.byteLength > 0) {
-          server.send(textDecoder.decode(raw.bodyBytes));
+          // Send binary if the incoming was binary, or if handler sets X-Ws-Binary header
+          if (isBinary || raw.headers.get("x-ws-binary") === "true") {
+            server.send(raw.bodyBytes);
+          } else {
+            server.send(textDecoder.decode(raw.bodyBytes));
+          }
         }
         // Check for close signal
         if (raw.headers.get("x-ws-close") === "true") {

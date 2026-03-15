@@ -360,10 +360,30 @@ function readRawResponse(exports: GoWasmExports, respPtr: number): WasmResponse 
   return { status, contentType, bodyBytes, rawHeaders, headers: respHeaders };
 }
 
+/** Streaming threshold — bodies larger than this use ReadableStream for chunked delivery. */
+const STREAM_THRESHOLD = 65536;
+const STREAM_CHUNK_SIZE = 16384;
+
 /** Convert raw response to a Web API Response object. */
 function toResponse(raw: WasmResponse): Response {
   const nullBodyStatus = raw.status === 101 || raw.status === 204 || raw.status === 205 || raw.status === 304;
-  return new Response(nullBodyStatus ? null : raw.bodyBytes, { status: raw.status, headers: raw.headers });
+  if (nullBodyStatus) {
+    return new Response(null, { status: raw.status, headers: raw.headers });
+  }
+  // Stream large bodies in chunks to reduce peak memory
+  if (raw.bodyBytes.byteLength > STREAM_THRESHOLD) {
+    const bytes = raw.bodyBytes;
+    const stream = new ReadableStream({
+      start(controller) {
+        for (let i = 0; i < bytes.byteLength; i += STREAM_CHUNK_SIZE) {
+          controller.enqueue(bytes.subarray(i, Math.min(i + STREAM_CHUNK_SIZE, bytes.byteLength)));
+        }
+        controller.close();
+      },
+    });
+    return new Response(stream, { status: raw.status, headers: raw.headers });
+  }
+  return new Response(raw.bodyBytes, { status: raw.status, headers: raw.headers });
 }
 
 // ============================================================================
@@ -429,15 +449,31 @@ async function handleWithFanout(
     const fetchMethod = (ctNlIdx >= 0 ? ctField.slice(0, ctNlIdx) : ctField).trim() || "GET";
     const fetchContentType = ctNlIdx >= 0 ? ctField.slice(ctNlIdx + 1) : "";
 
-    // Read call index from raw headers field (status=-1 responses use it for the index)
-    const callIndex = parseInt(raw.rawHeaders || "0", 10);
+    // Headers field: "callIndex\nKey: Value\n..." — first line is call index, rest are custom headers
+    const hdrsField = raw.rawHeaders || "0";
+    const hdrsNlIdx = hdrsField.indexOf("\n");
+    const callIndex = parseInt(hdrsNlIdx >= 0 ? hdrsField.slice(0, hdrsNlIdx) : hdrsField, 10);
+    const customHdrs = hdrsNlIdx >= 0 ? hdrsField.slice(hdrsNlIdx + 1) : "";
 
     const fetchInit: RequestInit = { method: fetchMethod };
+    const fetchHdrs: Record<string, string> = {};
+    if (fetchContentType) {
+      fetchHdrs["Content-Type"] = fetchContentType;
+    }
+    // Parse custom headers from Go's Client.Do
+    if (customHdrs) {
+      for (const line of customHdrs.split("\n")) {
+        const ci = line.indexOf(": ");
+        if (ci > 0) {
+          fetchHdrs[line.slice(0, ci)] = line.slice(ci + 2);
+        }
+      }
+    }
+    if (Object.keys(fetchHdrs).length > 0) {
+      fetchInit.headers = fetchHdrs;
+    }
     if (fetchBodyStr && fetchMethod !== "GET" && fetchMethod !== "HEAD") {
       fetchInit.body = fetchBodyStr;
-      if (fetchContentType) {
-        fetchInit.headers = { "Content-Type": fetchContentType };
-      }
     }
 
     const fetchResp = await fetch(fetchUrl, fetchInit).catch((err) =>
