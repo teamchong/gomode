@@ -9,6 +9,53 @@ import { describe, it, expect } from "vitest";
 
 const BASE = "http://localhost:8787";
 
+describe("Columnar SIMD analytics", () => {
+  it("computes per-column stats via SIMD", async () => {
+    const res = await fetch(`${BASE}/columnar`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ columns: { x: [1, 2, 3, 4, 5] } }),
+    });
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    const s = data.stats.x;
+    expect(s.count).toBe(5);
+    expect(s.sum).toBe(15);
+    expect(s.mean).toBe(3);
+    expect(s.min).toBe(1);
+    expect(s.max).toBe(5);
+    expect(s.variance).toBe(2);
+    expect(s.stddev).toBeCloseTo(1.4142, 3);
+  });
+
+  it("computes Pearson correlation between two columns", async () => {
+    const res = await fetch(`${BASE}/columnar`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ columns: { a: [1, 2, 3, 4, 5], b: [2, 4, 6, 8, 10] } }),
+    });
+    const data = await res.json();
+    // a and b are perfectly correlated (b = 2a)
+    expect(data.correlations.a_b).toBeCloseTo(1.0, 5);
+  });
+
+  it("handles single-column dataset (no correlations)", async () => {
+    const res = await fetch(`${BASE}/columnar`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ columns: { values: [10, 20, 30] } }),
+    });
+    const data = await res.json();
+    expect(data.stats.values.sum).toBe(60);
+    expect(data.correlations).toBeUndefined();
+  });
+
+  it("rejects non-POST", async () => {
+    const res = await fetch(`${BASE}/columnar`);
+    expect(res.status).toBe(405);
+  });
+});
+
 describe("Zig SIMD extended operations", () => {
   it("SubF64 — element-wise subtraction", async () => {
     const res = await fetch(`${BASE}/simd-ext`);

@@ -319,6 +319,53 @@ func main() {
 		})
 	})
 
+	// Columnar SIMD analytics — demonstrates columnar data processing
+	http.HandleFunc("/columnar", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		var req struct {
+			Columns map[string][]float64 `json:"columns"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON: "+err.Error(), 400)
+			return
+		}
+		if len(req.Columns) == 0 {
+			http.Error(w, "columns required", 400)
+			return
+		}
+
+		result := map[string]interface{}{}
+
+		// Compute stats for each column
+		stats := map[string]interface{}{}
+		for name, col := range req.Columns {
+			stats[name] = gomode.Stats(col)
+		}
+		result["stats"] = stats
+
+		// Compute correlation matrix for all pairs
+		names := make([]string, 0, len(req.Columns))
+		for name := range req.Columns {
+			names = append(names, name)
+		}
+		if len(names) >= 2 {
+			corr := map[string]float64{}
+			for i := 0; i < len(names); i++ {
+				for j := i + 1; j < len(names); j++ {
+					key := names[i] + "_" + names[j]
+					corr[key] = gomode.Correlation(req.Columns[names[i]], req.Columns[names[j]])
+				}
+			}
+			result["correlations"] = corr
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
+	})
+
 	// SIMD extended ops — sub, mul, clamp, map_linear
 	http.HandleFunc("/simd-ext", func(w http.ResponseWriter, r *http.Request) {
 		a := []float64{10, 20, 30, 40, 50}
