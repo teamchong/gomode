@@ -1,18 +1,57 @@
-# gomode
+# GoMode
 
-Go on Cloudflare Workers. TinyGo + Zig compiled into a single WASM binary — SIMD, zero-copy, no runtime overhead.
+Standard Go HTTP servers on Cloudflare Workers. Zero code changes.
 
-## Why
+Write normal `net/http` handlers, GoMode compiles them to WASM and runs them on the edge — with Zig SIMD for fast numeric computation, outbound `http.Get()`, and Durable Objects for state.
 
-Standard Go → WASM produces 3MB+ binaries with a heavy runtime. TinyGo produces small binaries but is missing `net/http`, `crypto`, and other stdlib packages. GoMode uses Zig to polyfill those gaps — linked at build time via `wasm-ld`, zero overhead.
+## Quick Start
 
-| | Binary size | Stdlib | Cold start | Warm latency |
-|---|---|---|---|---|
-| Go → WASM | 3MB+ | Full | Slow | Slow (heavy runtime) |
-| TinyGo → WASM | ~700KB | Incomplete | Fast | Fast |
-| **GoMode** | **58KB** | **Zig fills gaps (SIMD, crypto, allocator)** | **Fast** | **Fast (zero-copy)** |
+```go
+package main
 
-## How it works
+import (
+    "encoding/json"
+    "gomode"
+    "net/http"
+)
+
+func main() {
+    http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+        w.Write([]byte("Hello from GoMode!"))
+    })
+
+    http.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
+        data := []float64{1, 2, 3, 4, 5, 6, 7, 8}
+        sum := gomode.SumF64(data)           // Zig SIMD
+        min, max := gomode.MinMaxF64(data)   // Zig SIMD
+
+        json.NewEncoder(w).Encode(map[string]float64{
+            "sum": sum, "min": min, "max": max,
+        })
+    })
+
+    http.HandleFunc("/proxy", func(w http.ResponseWriter, r *http.Request) {
+        // Outbound fetch — works transparently
+        resp, err := http.Get("https://api.example.com/data")
+        if err != nil {
+            http.Error(w, err.Error(), 502)
+            return
+        }
+        // Process resp.Body as normal Go code...
+    })
+
+    http.ListenAndServe(":8080", nil)
+}
+
+//export handle_zerobuf
+func handleZerobuf(reqBase uint32) uint32 {
+    return http.HandleRequest(reqBase)
+}
+```
+
+That's it. Standard `net/http` — handlers, middleware, cookies, headers, JSON, `http.Get()`, `ServeMux` — all work unchanged.
+
+## How It Works
 
 ```
 Zig src → zig build-obj → zig-abi.o ──┐
@@ -20,50 +59,22 @@ Zig src → zig build-obj → zig-abi.o ──┐
 Go src  → tinygo build ───────────────┘
 
 CF Request → Worker (JS)
-  → zerobuf writes request into WASM memory
-  → Go reads request, calls Zig SIMD internally
-  → Go writes response
-  → JS reads response from WASM memory
+  → writes request into WASM memory (zerobuf zero-copy)
+  → calls handle_zerobuf(ptr)
+  → Go handler runs: reads request, calls Zig SIMD, writes response
+  → JS reads response bytes directly from WASM memory
   → CF Response
 ```
 
-Go calls Zig via CGo — compiles to direct WASM `call` instructions. Same linear memory, no imports, no serialization.
-
-## Usage
-
-```go
-package main
-
-import (
-	"gomode"
-	"unsafe"
-)
-
-//export handle_zerobuf
-func handleZerobuf(reqBase uint32) uint32 {
-	path := readZBString(uintptr(reqBase) + 1*16)
-
-	switch path {
-	case "/":
-		return writeResponse(200, "text/plain", "Hello from GoMode!")
-	case "/simd":
-		data := []float64{1, 2, 3, 4, 5, 6, 7, 8}
-		sum := gomode.ZigSimdSumF64(
-			uint32(uintptr(unsafe.Pointer(&data[0]))),
-			uint32(len(data)),
-		)
-		return writeResponse(200, "text/plain", formatFloat(sum))
-	}
-	return writeResponse(404, "text/plain", "not found")
-}
-
-func main() {}
-```
+- **Single WASM binary** — Go + Zig linked via `wasm-ld`, Zig functions are direct `call` instructions
+- **Zero-copy** — JS writes request fields into WASM memory, reads response as `Uint8Array`
+- **net/http overlay** — replaces TinyGo's missing `net/http` with a WASM-compatible implementation using identical types and interfaces
+- **Multi-fetch** — `http.Get()` works via a two-phase protocol, multiple calls per handler supported
 
 ## Build & Run
 
 ```bash
-# Install dependencies
+# Prerequisites
 brew install tinygo   # TinyGo compiler
 # Zig 0.15+ and wasm-ld required
 
@@ -75,73 +86,106 @@ npm run build
 # Dev server
 npm run dev           # wrangler dev on localhost:8787
 
-# Run tests
+# Run tests (84 tests)
 npm test
 ```
 
-## Benchmark
+## What Works
 
-All benchmarks on wrangler dev (local miniflare). Wrangler caps at ~3.7K req/sec.
+### Standard net/http
+- `http.HandleFunc`, `http.Handle`, `http.ServeMux` (with subtree routing)
+- `http.ResponseWriter` — `Write`, `WriteHeader`, `Header().Set/Get/Add`
+- `http.Request` — `Method`, `URL`, `Header`, `Body`, `FormValue`, `PostFormValue`, `Cookie`, `BasicAuth`, `UserAgent`, `Referer`
+- `http.Error`, `http.Redirect`, `http.NotFound`, `http.StripPrefix`, `http.MaxBytesReader`
+- `http.SetCookie` with full cookie attributes (Path, Domain, MaxAge, HttpOnly, Secure, SameSite)
+- `http.Get`, `http.Post`, `http.Head`, `Client.Do` — outbound fetch with multi-call support
+- Custom `http.Handler` structs, middleware chaining `func(http.Handler) http.Handler`
+- JSON via `encoding/json`, crypto via `crypto/sha256`
 
-| | Native Go | GoMode (Worker) | GoMode (DO) | Std Go WASM |
-|---|---|---|---|---|
-| **GET / req/sec** | 80,715 | 3,764 | 1,586 | 614 |
-| **GET /simd req/sec** | — | 3,692 | 1,574 | — |
-| **Latency (avg)** | 0.6ms | 3.2ms | 7.2ms | 78ms |
-| **Binary size** | native | 58KB | 58KB | 3.0MB |
+### Zig SIMD Operations
+All use WASM SIMD v128 instructions, called from Go via CGo (zero overhead):
 
-**6.1x faster** than standard Go WASM. **52x smaller** binary.
+| Function | Description |
+|----------|-------------|
+| `SumF64(data)` | Sum of float64 array |
+| `SumI32(data)` | Sum of int32 array |
+| `DotF64(a, b)` | Dot product |
+| `MinMaxF64(data)` | Min and max in one pass |
+| `ScaleF64(data, s)` | Multiply by scalar (in-place) |
+| `AddF64(dst, a, b)` | Element-wise addition |
+| `SubF64(dst, a, b)` | Element-wise subtraction |
+| `MulF64(dst, a, b)` | Element-wise multiplication |
+| `ClampF64(data, lo, hi)` | Clamp to range (in-place) |
+| `MapLinearF64(data, a, b)` | Affine transform y=ax+b (in-place) |
 
-SIMD route (Go calling Zig SIMD sum/dot/scale/minmax) runs at the same throughput as hello world — confirming zero overhead. Binary is 58KB with Zig bump allocator (`-gc=custom`).
+### Columnar Analytics
+Higher-level API built on SIMD primitives:
 
-## Two modes
+| Function | Description |
+|----------|-------------|
+| `Stats(col)` | Count, sum, mean, min, max, variance, stddev |
+| `NormalizeColumn(col)` | Normalize to [0,1] range (in-place) |
+| `Correlation(a, b)` | Pearson correlation coefficient |
+| `WeightedSum(data, weights)` | Weighted sum via dot product |
+
+## Two Modes
 
 | | Worker (`/*`) | Durable Object (`/do/*`) |
 |---|---|---|
-| Use case | Stateless APIs, transforms | Sessions, counters, websockets |
-| Concurrency | CF scales isolates | Single instance |
+| Use case | Stateless APIs, transforms | Sessions, counters, WebSockets |
+| Concurrency | CF scales isolates horizontally | Single instance per ID |
 | WASM lifetime | Cached per isolate | Alive for DO lifetime |
+| State | None | Go globals persist across requests |
+
+Both modes have full parity: body, headers, cookies, multi-fetch, zero-copy responses.
+
+## Benchmarks
+
+10,000 requests, 100 concurrency, local wrangler dev:
+
+| Endpoint | Native Go | GoMode WASM | Ratio |
+|----------|-----------|-------------|-------|
+| `GET /` (hello) | 59,912 rps | 3,022 rps | ~20x |
+| `GET /json` | 65,102 rps | 3,011 rps | ~22x |
+
+All GoMode endpoints (hello, JSON, SHA-256, SIMD, string ops) hit the same ~3,000 rps — the bottleneck is wrangler dev overhead (~30ms/req), not WASM execution. **Handler logic adds zero measurable latency.**
+
+WASM binary: **822KB**.
 
 ## Architecture
 
 ```
 worker/src/
-  worker.ts         — Entry point, routes to Worker or DO
-  go-do.ts          — Durable Object runtime
+  worker.ts         — Entry point, routes /* and /do/*
+  go-do.ts          — Durable Object (full parity with worker)
 
 zig-abi/src/
-  main.zig          — Memory mgmt + SIMD exports
+  main.zig          — Memory management + SIMD exports
   simd.zig          — WASM SIMD v128 batch operations
-  allocator.zig     — Bump allocator (replaces Go's GC)
+  allocator.zig     — Bump allocator
 
 go-sdk/
   gomode.go         — CGo wrappers for Zig functions
-  gc.go             — Custom GC bridge (routes runtime.alloc to Zig malloc)
+  simd.go           — High-level SIMD API (SumF64, DotF64, etc.)
+  columnar.go       — Columnar analytics (Stats, Correlation, etc.)
   zig_abi.h         — C header declaring Zig exports
 
+overlay/net/http/
+  server.go         — ServeMux, HandleFunc, ResponseWriter, HandleRequest
+  client.go         — http.Get/Post/Head, multi-fetch two-phase protocol
+  status.go         — Status codes and text
+  method.go         — HTTP method constants
+
 examples/
-  hello-worker/     — Example: hello world + SIMD demo
+  hello-worker/     — Full demo: routing, SIMD, crypto, fetch, middleware
+  analytics-api/    — Real-world API: stats, normalization, exchange rates
+
+test/               — 84 tests (conformance, compatibility, fetch, DO)
 ```
 
-## Status
+## CI
 
-- [x] Single WASM binary (TinyGo + Zig linked via wasm-ld)
-- [x] Zero-copy request/response via zerobuf
-- [x] Zig SIMD (sum, dot, scale, add, minmax) callable from Go
-- [x] Worker + Durable Object modes
-- [x] CGo FFI — Go calls Zig as direct WASM calls
-- [x] Zig bump allocator replacing Go's GC (`-gc=custom`)
-- [x] Fan-out architecture — JS fetches async data in parallel, WASM stays pure compute
-- [ ] Zig crypto (hashing, TLS)
-- [ ] Zig HTTP parsing
-- [ ] Worker RPC for parallel compute (service bindings)
-- [ ] Production CF edge benchmarks
-
-## Related
-
-- [zerobuf](https://github.com/user/zerobuf) — Shared memory layout for JS and WASM
-- [nodemode](https://github.com/user/nodemode) — Node.js on CF Workers
-- [pymode](https://github.com/user/pymode) — Python on CF Workers
+GitHub Actions runs on every push and PR: builds Zig + TinyGo, starts wrangler dev, runs all 84 tests.
 
 ## License
 
