@@ -920,13 +920,17 @@ func HandleRequest(reqBase uint32) uint32 {
 	// If the handler triggered a fetch, return status=-1 so JS does the fetch and replays.
 	// Body field: URL + "\n" + fetchBody (URL can't contain newlines)
 	// Content-type field: method + "\n" + fetchContentType
-	// Headers field: call index
+	// Headers field: callIndex + "\n" + custom headers (Key: Value\n format)
 	if fetchPending {
 		fetchPending = false
+		hdrs := itoa(fetchPendingIndex)
+		if fetchHeaders != "" {
+			hdrs += "\n" + fetchHeaders
+		}
 		return writeZerobufResponse(-1,
 			fetchMethod+"\n"+fetchContentType,
 			fetchURL+"\n"+fetchBody,
-			itoa(fetchPendingIndex))
+			hdrs)
 	}
 
 	// All fetches resolved — clear cache for next request

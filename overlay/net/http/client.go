@@ -41,6 +41,7 @@ var fetchURL string
 var fetchMethod string
 var fetchBody string
 var fetchContentType string
+var fetchHeaders string
 var fetchPending bool
 var fetchCallIndex int
 var fetchPendingIndex int
@@ -49,7 +50,7 @@ var fetchResults map[int]*Response
 // errFetchPending is returned by doFetch when a call hasn't been resolved yet.
 var errFetchPending = &httpError{"gomode: fetch pending"}
 
-func doFetch(method, rawurl, body, contentType string) (*Response, error) {
+func doFetch(method, rawurl, body, contentType string, headers string) (*Response, error) {
 	idx := fetchCallIndex
 	fetchCallIndex++
 
@@ -66,6 +67,7 @@ func doFetch(method, rawurl, body, contentType string) (*Response, error) {
 	fetchMethod = method
 	fetchBody = body
 	fetchContentType = contentType
+	fetchHeaders = headers
 	fetchPending = true
 	return nil, errFetchPending
 }
@@ -129,23 +131,25 @@ func Head(url string) (*Response, error) {
 }
 
 func (c *Client) Get(url string) (*Response, error) {
-	return doFetch(MethodGet, url, "", "")
+	return doFetch(MethodGet, url, "", "", "")
 }
 
 func (c *Client) Head(url string) (*Response, error) {
-	return doFetch(MethodHead, url, "", "")
+	return doFetch(MethodHead, url, "", "", "")
 }
 
 func (c *Client) Post(url, contentType string, body io.Reader) (*Response, error) {
-	return doFetch(MethodPost, url, readBody(body), contentType)
+	return doFetch(MethodPost, url, readBody(body), contentType, "")
 }
 
 func (c *Client) Do(req *Request) (*Response, error) {
 	ct := ""
+	hdrs := ""
 	if req.Header != nil {
 		ct = req.Header.Get("Content-Type")
+		hdrs = serializeHeaders(req.Header)
 	}
-	return doFetch(req.Method, req.URL.String(), readBody(req.Body), ct)
+	return doFetch(req.Method, req.URL.String(), readBody(req.Body), ct, hdrs)
 }
 
 func NewRequest(method, rawurl string, body io.Reader) (*Request, error) {
