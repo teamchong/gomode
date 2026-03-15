@@ -319,6 +319,32 @@ func main() {
 		})
 	})
 
+	// SIMD extended ops — sub, mul, clamp, map_linear
+	http.HandleFunc("/simd-ext", func(w http.ResponseWriter, r *http.Request) {
+		a := []float64{10, 20, 30, 40, 50}
+		b := []float64{1, 2, 3, 4, 5}
+
+		diff := make([]float64, len(a))
+		gomode.SubF64(diff, a, b)
+
+		prod := make([]float64, len(a))
+		gomode.MulF64(prod, a, b)
+
+		clamped := []float64{-5, 0, 15, 50, 100}
+		gomode.ClampF64(clamped, 0, 40)
+
+		linear := []float64{1, 2, 3, 4, 5}
+		gomode.MapLinearF64(linear, 2.0, 10.0) // y = 2x + 10
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"sub":        diff,
+			"mul":        prod,
+			"clamp":      clamped,
+			"map_linear": linear,
+		})
+	})
+
 	// Multi-fetch — calls http.Get() twice in one handler
 	http.HandleFunc("/multi-fetch", func(w http.ResponseWriter, r *http.Request) {
 		url1 := r.FormValue("url1")

@@ -71,3 +71,19 @@ func ZigSimdMinmaxF64(ptr uint32, count uint32, outPtr uint32) {
 func ZigSimdDotF64(aPtr uint32, bPtr uint32, count uint32) float64 {
 	return float64(C.zig_simd_dot_f64(C.uint32_t(aPtr), C.uint32_t(bPtr), C.uint32_t(count)))
 }
+
+func ZigSimdSubF64(dstPtr uint32, aPtr uint32, bPtr uint32, count uint32) {
+	C.zig_simd_sub_f64(C.uint32_t(dstPtr), C.uint32_t(aPtr), C.uint32_t(bPtr), C.uint32_t(count))
+}
+
+func ZigSimdMulF64(dstPtr uint32, aPtr uint32, bPtr uint32, count uint32) {
+	C.zig_simd_mul_f64(C.uint32_t(dstPtr), C.uint32_t(aPtr), C.uint32_t(bPtr), C.uint32_t(count))
+}
+
+func ZigSimdClampF64(ptr uint32, count uint32, lo float64, hi float64) {
+	C.zig_simd_clamp_f64(C.uint32_t(ptr), C.uint32_t(count), C.double(lo), C.double(hi))
+}
+
+func ZigSimdMapLinearF64(ptr uint32, count uint32, a float64, b float64) {
+	C.zig_simd_map_linear_f64(C.uint32_t(ptr), C.uint32_t(count), C.double(a), C.double(b))
+}

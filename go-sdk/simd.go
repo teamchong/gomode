@@ -50,6 +50,46 @@ func AddF64(dst, a, b []float64) {
 	ZigSimdAddF64(dstPtr, aPtr, bPtr, uint32(len(a)))
 }
 
+// SubF64 subtracts two float64 slices element-wise into dst using WASM SIMD.
+func SubF64(dst, a, b []float64) {
+	if len(a) == 0 || len(b) == 0 {
+		return
+	}
+	dstPtr := uint32(uintptr(unsafe.Pointer(&dst[0])))
+	aPtr := uint32(uintptr(unsafe.Pointer(&a[0])))
+	bPtr := uint32(uintptr(unsafe.Pointer(&b[0])))
+	ZigSimdSubF64(dstPtr, aPtr, bPtr, uint32(len(a)))
+}
+
+// MulF64 multiplies two float64 slices element-wise into dst using WASM SIMD.
+func MulF64(dst, a, b []float64) {
+	if len(a) == 0 || len(b) == 0 {
+		return
+	}
+	dstPtr := uint32(uintptr(unsafe.Pointer(&dst[0])))
+	aPtr := uint32(uintptr(unsafe.Pointer(&a[0])))
+	bPtr := uint32(uintptr(unsafe.Pointer(&b[0])))
+	ZigSimdMulF64(dstPtr, aPtr, bPtr, uint32(len(a)))
+}
+
+// ClampF64 clamps each element to [lo, hi] range in-place using WASM SIMD.
+func ClampF64(data []float64, lo, hi float64) {
+	if len(data) == 0 {
+		return
+	}
+	ptr := uint32(uintptr(unsafe.Pointer(&data[0])))
+	ZigSimdClampF64(ptr, uint32(len(data)), lo, hi)
+}
+
+// MapLinearF64 applies y = a*x + b to each element in-place using WASM SIMD.
+func MapLinearF64(data []float64, a, b float64) {
+	if len(data) == 0 {
+		return
+	}
+	ptr := uint32(uintptr(unsafe.Pointer(&data[0])))
+	ZigSimdMapLinearF64(ptr, uint32(len(data)), a, b)
+}
+
 // MinMaxF64 returns the min and max of a float64 slice in one pass using WASM SIMD.
 func MinMaxF64(data []float64) (min, max float64) {
 	if len(data) == 0 {

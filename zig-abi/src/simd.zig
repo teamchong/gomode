@@ -136,6 +136,94 @@ pub fn minmaxF64(data: []const f64) struct { min: f64, max: f64 } {
     return .{ .min = min_val, .max = max_val };
 }
 
+/// Element-wise subtraction: dst[i] = a[i] - b[i].
+pub fn subF64(dst: []f64, a: []const f64, b: []const f64) void {
+    const len = @min(dst.len, @min(a.len, b.len));
+    if (len == 0) return;
+
+    const chunks = len / VEC_F64_LEN;
+    const remainder = len % VEC_F64_LEN;
+
+    const d: [*]@Vector(VEC_F64_LEN, f64) = @alignCast(@ptrCast(dst.ptr));
+    const va: [*]const @Vector(VEC_F64_LEN, f64) = @alignCast(@ptrCast(a.ptr));
+    const vb: [*]const @Vector(VEC_F64_LEN, f64) = @alignCast(@ptrCast(b.ptr));
+    for (0..chunks) |i| {
+        d[i] = va[i] - vb[i];
+    }
+
+    for (0..remainder) |i| {
+        const idx = chunks * VEC_F64_LEN + i;
+        dst[idx] = a[idx] - b[idx];
+    }
+}
+
+/// Element-wise multiplication: dst[i] = a[i] * b[i].
+pub fn mulF64(dst: []f64, a: []const f64, b: []const f64) void {
+    const len = @min(dst.len, @min(a.len, b.len));
+    if (len == 0) return;
+
+    const chunks = len / VEC_F64_LEN;
+    const remainder = len % VEC_F64_LEN;
+
+    const d: [*]@Vector(VEC_F64_LEN, f64) = @alignCast(@ptrCast(dst.ptr));
+    const va: [*]const @Vector(VEC_F64_LEN, f64) = @alignCast(@ptrCast(a.ptr));
+    const vb: [*]const @Vector(VEC_F64_LEN, f64) = @alignCast(@ptrCast(b.ptr));
+    for (0..chunks) |i| {
+        d[i] = va[i] * vb[i];
+    }
+
+    for (0..remainder) |i| {
+        const idx = chunks * VEC_F64_LEN + i;
+        dst[idx] = a[idx] * b[idx];
+    }
+}
+
+/// Clamp each element to [lo, hi] range, in-place.
+pub fn clampF64(data: []f64, lo: f64, hi: f64) void {
+    const len = data.len;
+    if (len == 0) return;
+
+    const lo_v: @Vector(VEC_F64_LEN, f64) = @splat(lo);
+    const hi_v: @Vector(VEC_F64_LEN, f64) = @splat(hi);
+    const chunks = len / VEC_F64_LEN;
+    const remainder = len % VEC_F64_LEN;
+
+    const vecs: [*]@Vector(VEC_F64_LEN, f64) = @alignCast(@ptrCast(data.ptr));
+    for (0..chunks) |i| {
+        var v = vecs[i];
+        const lt = v < lo_v;
+        const gt = v > hi_v;
+        v = @select(f64, lt, lo_v, v);
+        v = @select(f64, gt, hi_v, v);
+        vecs[i] = v;
+    }
+
+    for (data[chunks * VEC_F64_LEN ..][0..remainder]) |*v| {
+        if (v.* < lo) v.* = lo;
+        if (v.* > hi) v.* = hi;
+    }
+}
+
+/// Affine transform: data[i] = a * data[i] + b, in-place.
+pub fn mapLinearF64(data: []f64, a: f64, b: f64) void {
+    const len = data.len;
+    if (len == 0) return;
+
+    const a_v: @Vector(VEC_F64_LEN, f64) = @splat(a);
+    const b_v: @Vector(VEC_F64_LEN, f64) = @splat(b);
+    const chunks = len / VEC_F64_LEN;
+    const remainder = len % VEC_F64_LEN;
+
+    const vecs: [*]@Vector(VEC_F64_LEN, f64) = @alignCast(@ptrCast(data.ptr));
+    for (0..chunks) |i| {
+        vecs[i] = vecs[i] * a_v + b_v;
+    }
+
+    for (data[chunks * VEC_F64_LEN ..][0..remainder]) |*v| {
+        v.* = a * v.* + b;
+    }
+}
+
 /// Dot product of two f64 slices.
 pub fn dotF64(a: []const f64, b: []const f64) f64 {
     const len = @min(a.len, b.len);

@@ -104,3 +104,23 @@ export fn zig_simd_dot_f64(a_ptr: u32, b_ptr: u32, count: u32) f64 {
     if (a_ptr == 0 or b_ptr == 0 or count == 0) return 0;
     return simd.dotF64(ptrToF64Slice(a_ptr, count), ptrToF64Slice(b_ptr, count));
 }
+
+export fn zig_simd_sub_f64(dst_ptr: u32, a_ptr: u32, b_ptr: u32, count: u32) void {
+    if (dst_ptr == 0 or a_ptr == 0 or b_ptr == 0 or count == 0) return;
+    simd.subF64(ptrToF64SliceMut(dst_ptr, count), ptrToF64Slice(a_ptr, count), ptrToF64Slice(b_ptr, count));
+}
+
+export fn zig_simd_mul_f64(dst_ptr: u32, a_ptr: u32, b_ptr: u32, count: u32) void {
+    if (dst_ptr == 0 or a_ptr == 0 or b_ptr == 0 or count == 0) return;
+    simd.mulF64(ptrToF64SliceMut(dst_ptr, count), ptrToF64Slice(a_ptr, count), ptrToF64Slice(b_ptr, count));
+}
+
+export fn zig_simd_clamp_f64(ptr: u32, count: u32, lo: f64, hi: f64) void {
+    if (ptr == 0 or count == 0) return;
+    simd.clampF64(ptrToF64SliceMut(ptr, count), lo, hi);
+}
+
+export fn zig_simd_map_linear_f64(ptr: u32, count: u32, a: f64, b: f64) void {
+    if (ptr == 0 or count == 0) return;
+    simd.mapLinearF64(ptrToF64SliceMut(ptr, count), a, b);
+}

@@ -9,6 +9,32 @@ import { describe, it, expect } from "vitest";
 
 const BASE = "http://localhost:8787";
 
+describe("Zig SIMD extended operations", () => {
+  it("SubF64 — element-wise subtraction", async () => {
+    const res = await fetch(`${BASE}/simd-ext`);
+    const data = await res.json();
+    expect(data.sub).toEqual([9, 18, 27, 36, 45]);
+  });
+
+  it("MulF64 — element-wise multiplication", async () => {
+    const res = await fetch(`${BASE}/simd-ext`);
+    const data = await res.json();
+    expect(data.mul).toEqual([10, 40, 90, 160, 250]);
+  });
+
+  it("ClampF64 — clamp to [0, 40]", async () => {
+    const res = await fetch(`${BASE}/simd-ext`);
+    const data = await res.json();
+    expect(data.clamp).toEqual([0, 0, 15, 40, 40]);
+  });
+
+  it("MapLinearF64 — affine transform y = 2x + 10", async () => {
+    const res = await fetch(`${BASE}/simd-ext`);
+    const data = await res.json();
+    expect(data.map_linear).toEqual([12, 14, 16, 18, 20]);
+  });
+});
+
 describe("net/http conformance", () => {
   // ---- Routing ----
 

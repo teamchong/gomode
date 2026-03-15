@@ -29,5 +29,9 @@ void zig_simd_scale_f64(uint32_t ptr, uint32_t count, double scalar);
 void zig_simd_add_f64(uint32_t dst, uint32_t a, uint32_t b, uint32_t count);
 void zig_simd_minmax_f64(uint32_t ptr, uint32_t count, uint32_t out);
 double zig_simd_dot_f64(uint32_t a, uint32_t b, uint32_t count);
+void zig_simd_sub_f64(uint32_t dst, uint32_t a, uint32_t b, uint32_t count);
+void zig_simd_mul_f64(uint32_t dst, uint32_t a, uint32_t b, uint32_t count);
+void zig_simd_clamp_f64(uint32_t ptr, uint32_t count, double lo, double hi);
+void zig_simd_map_linear_f64(uint32_t ptr, uint32_t count, double a, double b);
 
 #endif
