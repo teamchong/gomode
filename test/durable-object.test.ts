@@ -164,6 +164,52 @@ describe("Durable Object — KV bindings", () => {
   });
 });
 
+describe("Durable Object — R2-backed /data filesystem", () => {
+  it("write and read file in /data/ (R2-backed path)", async () => {
+    const writeRes = await fetch(`${BASE}/fs/write?path=/data/do-test.txt&content=persistent-data`);
+    expect(writeRes.status).toBe(200);
+    const writeData = await writeRes.json();
+    expect(writeData.status).toBe("written");
+
+    const readRes = await fetch(`${BASE}/fs/read?path=/data/do-test.txt`);
+    expect(readRes.status).toBe(200);
+    const readData = await readRes.json();
+    expect(readData.content).toBe("persistent-data");
+  });
+
+  it("stat file in /data/ returns correct size", async () => {
+    await fetch(`${BASE}/fs/write?path=/data/stat-test.txt&content=twelve+chars`);
+    const res = await fetch(`${BASE}/fs/stat?path=/data/stat-test.txt`);
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.name).toBe("stat-test.txt");
+    expect(data.isDir).toBe(false);
+    expect(data.size).toBeGreaterThan(0);
+  });
+
+  it("readdir in /data/ lists written files", async () => {
+    await fetch(`${BASE}/fs/write?path=/data/list-a.txt&content=a`);
+    await fetch(`${BASE}/fs/write?path=/data/list-b.txt&content=b`);
+    const res = await fetch(`${BASE}/fs/readdir?path=/data`);
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.entries).toContain("list-a.txt");
+    expect(data.entries).toContain("list-b.txt");
+  });
+
+  it("delete file in /data/ marks it for R2 removal", async () => {
+    await fetch(`${BASE}/fs/write?path=/data/del-me.txt&content=bye`);
+    const statRes = await fetch(`${BASE}/fs/stat?path=/data/del-me.txt`);
+    expect(statRes.status).toBe(200);
+
+    const delRes = await fetch(`${BASE}/fs/remove?path=/data/del-me.txt`);
+    expect(delRes.status).toBe(200);
+
+    const readRes = await fetch(`${BASE}/fs/read?path=/data/del-me.txt`);
+    expect(readRes.status).toBe(500);
+  });
+});
+
 describe("Durable Object — state persistence across requests", () => {
   it("WASM instance persists (same DO handles multiple requests)", async () => {
     // Make two requests — both should succeed, proving the DO instance stays alive

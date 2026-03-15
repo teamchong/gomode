@@ -45,9 +45,21 @@ interface DirtyFile {
   data: Uint8Array;
 }
 
+/** File metadata from SQLite index — file exists in R2 but not yet loaded. */
+interface FileIndexEntry {
+  r2Key: string;
+  size: number;
+}
+
 /**
  * R2-backed filesystem state. Created once per DO lifetime.
  * Worker mode creates a fresh instance per request (no R2, /tmp only).
+ *
+ * Lazy-load architecture:
+ *   - On DO init: SQLite index loaded into `fileIndex` (paths + R2 keys, no content)
+ *   - On path_open: if file in index but not in `files`, added to `pendingLoads`
+ *   - After handler returns: JS checks pendingLoads, fetches from R2, replays handler
+ *   - On replay: file is now in `files`, path_open succeeds
  */
 export class WasiFs {
   /** In-memory file contents: normalized path → data */
@@ -58,6 +70,10 @@ export class WasiFs {
   readonly dirty = new Map<string, DirtyFile>();
   /** Files deleted during this request, to be removed from R2 */
   readonly deleted = new Set<string>();
+  /** Files known to exist in R2 but not loaded into memory yet */
+  readonly fileIndex = new Map<string, FileIndexEntry>();
+  /** Files requested by path_open but not yet loaded — triggers R2 fetch + replay */
+  readonly pendingLoads = new Map<string, FileIndexEntry>();
 
   constructor() {
     // /tmp always exists (in-memory only, not persisted)
@@ -119,6 +135,7 @@ export class WasiFs {
   markDirty(path: string, data: Uint8Array): void {
     if (path.startsWith("data/")) {
       this.dirty.set(path, { path, data });
+      this.fileIndex.delete(path); // now in memory, no longer "unloaded"
     }
   }
 
@@ -132,18 +149,17 @@ export class WasiFs {
 }
 
 /**
- * Pre-load files from R2 into the in-memory VFS.
- * Called once on DO init. Populates both files map and directory index.
+ * Load file index from SQLite into WasiFs.fileIndex.
+ * No R2 reads — file contents are demand-paged on first access via two-phase replay.
+ * Called once on DO init.
  */
-export async function preloadFromR2(
+export function loadIndex(
   fs: WasiFs,
-  bucket: R2Bucket,
   workspace: string,
   sql: { exec: (query: string, ...params: unknown[]) => { toArray: () => Record<string, unknown>[] } }
-): Promise<void> {
-  // Load file index from SQLite
+): void {
   const rows = sql.exec(
-    "SELECT path, size, is_dir FROM files"
+    "SELECT path, r2_key, size, is_dir FROM files"
   ).toArray();
 
   for (const row of rows) {
@@ -153,16 +169,34 @@ export async function preloadFromR2(
     if (isDir) {
       fs.ensureDir(path);
     } else {
-      // Load file content from R2
-      const key = `${workspace}/${path}`;
-      const obj = await bucket.get(key);
-      if (obj) {
-        const data = new Uint8Array(await obj.arrayBuffer());
-        fs.files.set(path, data);
-        fs.registerFile(path);
-      }
+      const r2Key = (row.r2_key as string) || `${workspace}/${path}`;
+      fs.fileIndex.set(path, { r2Key, size: row.size as number });
+      fs.registerFile(path);
     }
   }
+}
+
+/**
+ * Load pending files from R2 into memory.
+ * Called by the JS multi-fetch loop when WasiFs.pendingLoads is non-empty.
+ * After this completes, the handler is replayed and path_open finds the files in memory.
+ */
+export async function loadPendingFiles(
+  fs: WasiFs,
+  bucket: R2Bucket,
+): Promise<void> {
+  for (const [path, entry] of fs.pendingLoads) {
+    const obj = await bucket.get(entry.r2Key);
+    if (obj) {
+      const data = new Uint8Array(await obj.arrayBuffer());
+      fs.files.set(path, data);
+    } else {
+      // File in index but missing from R2 — register as empty
+      fs.files.set(path, new Uint8Array(0));
+    }
+    fs.fileIndex.delete(path); // now loaded, no longer "pending"
+  }
+  fs.pendingLoads.clear();
 }
 
 /**
@@ -484,6 +518,12 @@ export function buildWasiImports(
         view().setUint32(retPtr, fd, true);
         return ESUCCESS;
       }
+      // File exists in R2 index but not loaded — queue for lazy load
+      const indexEntry = wasiFs.fileIndex.get(fullPath);
+      if (indexEntry) {
+        wasiFs.pendingLoads.set(fullPath, indexEntry);
+        return ENOENT;
+      }
       return ENOENT;
     },
 
@@ -497,14 +537,16 @@ export function buildWasiImports(
 
       const data = wasiFs.files.get(fullPath);
       const isDirPath = wasiFs.isDir(fullPath);
-      if (!data && !isDirPath) return ENOENT;
+      const indexEntry = wasiFs.fileIndex.get(fullPath);
+      if (!data && !isDirPath && !indexEntry) return ENOENT;
 
       const v = view();
       const m = u8();
       m.fill(0, retPtr, retPtr + 64);
       v.setUint8(retPtr + 16, isDirPath && !data ? 3 : 4);
       v.setBigUint64(retPtr + 24, BigInt(1), true);
-      v.setBigUint64(retPtr + 32, BigInt(data ? data.length : 0), true);
+      const fileSize = data ? data.length : (indexEntry ? indexEntry.size : 0);
+      v.setBigUint64(retPtr + 32, BigInt(fileSize), true);
       return ESUCCESS;
     },
 

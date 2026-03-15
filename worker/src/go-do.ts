@@ -9,7 +9,7 @@
  */
 
 import goWasmModule from "./go.wasm";
-import { WasiFs, buildWasiImports, initSchema, preloadFromR2, flushToR2 } from "./wasi";
+import { WasiFs, buildWasiImports, initSchema, loadIndex, loadPendingFiles, flushToR2 } from "./wasi";
 
 const textDecoder = new TextDecoder();
 const textEncoder = new TextEncoder();
@@ -144,11 +144,11 @@ export class GoDO implements DurableObject {
   }
 
   private async initWasm(): Promise<void> {
-    // Initialize SQLite schema and pre-load files from R2
+    // Initialize SQLite schema and load file index (no R2 reads — lazy loaded on access)
     if (this.env.FS_BUCKET) {
       const sql = this.state.storage.sql;
       initSchema(sql);
-      await preloadFromR2(this.wasiFs, this.env.FS_BUCKET, this.state.id.toString(), sql);
+      loadIndex(this.wasiFs, this.state.id.toString(), sql);
     }
 
     const instance = await WebAssembly.instantiate(goWasmModule, {
@@ -214,8 +214,30 @@ export class GoDO implements DurableObject {
     }
     let raw = readRawResponse(exports, respPtr);
 
-    while (raw.status === -1) {
-      // Body field: "URL\nfetchBody", Content-type field: "method\nfetchContentType"
+    // Unified replay loop: handles lazy file loads from R2 AND multi-fetch/binding ops.
+    // A single handler invocation may need both (e.g. read a file then call an API).
+    // Loop continues until handler returns a final response (status >= 0, no pending loads).
+    for (;;) {
+      // Check for pending file loads (path_open found file in index but not in memory)
+      if (this.env.FS_BUCKET && this.wasiFs.pendingLoads.size > 0) {
+        await loadPendingFiles(this.wasiFs, this.env.FS_BUCKET);
+        const reqPtrReplay = this.buildRequest(exports, request.method, pathAndQuery, body, request.headers);
+        try {
+          respPtr = exports.handle_zerobuf(reqPtrReplay);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          return new Response(`panic: ${msg}`, {
+            status: 500,
+            headers: { "content-type": "text/plain; charset=utf-8" },
+          });
+        }
+        raw = readRawResponse(exports, respPtr);
+        continue;
+      }
+
+      // Check for multi-fetch / binding ops (status=-1 means handler needs async work)
+      if (raw.status !== -1) break;
+
       const bodyField = textDecoder.decode(raw.bodyBytes);
       const nlIdx = bodyField.indexOf("\n");
       const fetchUrl = (nlIdx >= 0 ? bodyField.slice(0, nlIdx) : bodyField).trim();
